@@ -33,24 +33,98 @@ Usage:
 """
 
 import argparse
-import collections
 import csv
 import gzip
-import io
 import json
 import logging
-import os
 import re
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Counter, Dict, List, Optional, Tuple
-from collections import defaultdict, Counter
+from typing import Optional, TypedDict, Union, cast
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
+
+LogFieldValue = Union[
+    str,
+    int,
+    float,
+    bool,
+    None,
+    list["LogFieldValue"],
+    dict[str, "LogFieldValue"],
+]
+TimestampValue = Optional[Union[int, float]]
+
+
+class LogEntry(TypedDict):
+    """Normalized log record emitted by all supported parsers."""
+
+    timestamp: TimestampValue
+    level: str
+    service: Optional[str]
+    message: str
+    fields: dict[str, LogFieldValue]
+    format: str
+
+
+class TimeRange(TypedDict):
+    """Inclusive timestamp range for parsed log entries."""
+
+    start: str
+    end: str
+    duration_hours: float
+
+
+class Summary(TypedDict):
+    """Top-level aggregation payload written to JSON reports."""
+
+    total_entries: int
+    time_range: Optional[TimeRange]
+    by_level: dict[str, int]
+    by_service: dict[str, int]
+    by_hour: dict[str, int]
+    top_errors: dict[str, int]
+    error_rate: float
+    services_with_errors: dict[str, int]
+
+
+class ErrorTimelinePoint(TypedDict):
+    """Per-hour error count in the generated timeline."""
+
+    hour: str
+    count: int
+
+
+class ServiceBreakdown(TypedDict):
+    """Counters grouped by service and severity."""
+
+    total: int
+    errors: int
+    warns: int
+    infos: int
+    debugs: int
+
+
+def _coerce_timestamp(value: object) -> TimestampValue:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
+
+
+def _coerce_text(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+def _coerce_optional_text(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
 
 # ---------------------------------------------------------------------------
 # LOG PARSERS
@@ -59,21 +133,21 @@ logger = logging.getLogger("log_aggregator")
 class LogParser:
     """Base class for log parsers. Subclasses implement format-specific parsing."""
 
-    TIMESTAMP_PATTERNS = [
+    TIMESTAMP_PATTERNS: list[tuple[str, str]] = [
         (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', 'iso8601'),
         (r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', 'standard'),
         (r'^\[?\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}', 'nginx'),
         (r'^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}', 'syslog'),
     ]
 
-    LEVEL_PATTERNS = [
+    LEVEL_PATTERNS: list[tuple[str, str]] = [
         (r'\b(ERROR|FATAL|CRITICAL)\b', 'error'),
         (r'\b(WARN|WARNING)\b', 'warn'),
         (r'\b(INFO|NOTICE)\b', 'info'),
         (r'\b(DEBUG|TRACE)\b', 'debug'),
     ]
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         raise NotImplementedError
 
     def extract_timestamp(self, line: str) -> Optional[int]:
@@ -116,16 +190,25 @@ class LogParser:
 class JSONLogParser(LogParser):
     """Parses structured JSON log lines."""
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         try:
-            entry = json.loads(line.strip())
-            if not isinstance(entry, dict):
+            raw_entry = json.loads(line.strip())
+            if not isinstance(raw_entry, dict):
                 return None
+            entry = cast(dict[str, LogFieldValue], raw_entry)
+            timestamp = (
+                entry.get('timestamp')
+                or entry.get('time')
+                or entry.get('@timestamp')
+            )
+            level = entry.get('level') or entry.get('severity') or entry.get('lvl')
+            service = entry.get('service') or entry.get('logger') or entry.get('app')
+            message = entry.get('message') or entry.get('msg') or entry.get('event')
             return {
-                'timestamp': entry.get('timestamp') or entry.get('time') or entry.get('@timestamp'),
-                'level': entry.get('level') or entry.get('severity') or entry.get('lvl', 'info'),
-                'service': entry.get('service') or entry.get('logger') or entry.get('app'),
-                'message': entry.get('message') or entry.get('msg') or entry.get('event', ''),
+                'timestamp': _coerce_timestamp(timestamp),
+                'level': _coerce_text(level, 'info'),
+                'service': _coerce_optional_text(service),
+                'message': _coerce_text(message),
                 'fields': entry,
                 'format': 'json',
             }
@@ -136,7 +219,7 @@ class JSONLogParser(LogParser):
 class TextLogParser(LogParser):
     """Parses plain text log lines."""
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         line = line.strip()
         if not line:
             return None
@@ -154,7 +237,7 @@ class TextLogParser(LogParser):
 class NginxLogParser(LogParser):
     """Parses Nginx access log format."""
 
-    NGINX_PATTERN = re.compile(
+    NGINX_PATTERN: re.Pattern[str] = re.compile(
         r'(\S+)\s+'
         r'(\S+)\s+'
         r'(\S+)\s+'
@@ -166,7 +249,7 @@ class NginxLogParser(LogParser):
         r'"([^"]*)"'
     )
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         match = self.NGINX_PATTERN.match(line)
         if not match:
             return None
@@ -203,15 +286,17 @@ class NginxLogParser(LogParser):
 # ---------------------------------------------------------------------------
 
 class LogAggregator:
-    def __init__(self):
-        self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
-        self.entries: List[Dict[str, Any]] = []
-        self.level_counts: Counter = Counter()
-        self.service_counts: Counter = Counter()
-        self.hourly_counts: Counter = Counter()
-        self.error_patterns: Counter = Counter()
-        self.top_errors: Counter = Counter()
-        self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+    """Aggregates normalized log entries and exports summary reports."""
+
+    def __init__(self) -> None:
+        self.parsers: list[LogParser] = [JSONLogParser(), TextLogParser(), NginxLogParser()]
+        self.entries: list[LogEntry] = []
+        self.level_counts: Counter[str] = Counter()
+        self.service_counts: Counter[str] = Counter()
+        self.hourly_counts: Counter[str] = Counter()
+        self.error_patterns: Counter[str] = Counter()
+        self.top_errors: Counter[str] = Counter()
+        self.errors_by_service: defaultdict[str, list[str]] = defaultdict(list)
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
@@ -251,7 +336,7 @@ class LogAggregator:
                     self.hourly_counts[hour] += 1
                 level = entry.get('level', 'unknown').lower()
                 self.level_counts[level] += 1
-                service = entry.get('service', 'unknown')
+                service = entry.get('service') or 'unknown'
                 self.service_counts[service] += 1
                 if level in ('error', 'critical'):
                     msg = entry.get('message', '')
@@ -262,7 +347,7 @@ class LogAggregator:
                 return True
         return False
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self) -> Summary:
         return {
             'total_entries': len(self.entries),
             'time_range': self._get_time_range(),
@@ -277,10 +362,10 @@ class LogAggregator:
             },
         }
 
-    def _get_time_range(self) -> Optional[Dict[str, str]]:
+    def _get_time_range(self) -> Optional[TimeRange]:
         timestamps = [
             e['timestamp'] for e in self.entries
-            if e.get('timestamp')
+            if e.get('timestamp') is not None
         ]
         if not timestamps:
             return None
@@ -297,8 +382,8 @@ class LogAggregator:
         errors = self.level_counts.get('error', 0) + self.level_counts.get('critical', 0)
         return round(errors / total * 100, 2)
 
-    def get_error_timeline(self) -> List[Dict[str, Any]]:
-        errors_by_hour: Counter = Counter()
+    def get_error_timeline(self) -> list[ErrorTimelinePoint]:
+        errors_by_hour: Counter[str] = Counter()
         for entry in self.entries:
             level = entry.get('level', '').lower()
             if level in ('error', 'critical'):
@@ -311,10 +396,10 @@ class LogAggregator:
             for hour, count in sorted(errors_by_hour.items())
         ]
 
-    def get_service_breakdown(self) -> Dict[str, Dict[str, Any]]:
-        breakdown: Dict[str, Dict[str, Any]] = {}
+    def get_service_breakdown(self) -> dict[str, ServiceBreakdown]:
+        breakdown: dict[str, ServiceBreakdown] = {}
         for entry in self.entries:
-            svc = entry.get('service', 'unknown')
+            svc = entry.get('service') or 'unknown'
             level = entry.get('level', 'unknown')
             if svc not in breakdown:
                 breakdown[svc] = {'total': 0, 'errors': 0, 'warns': 0, 'infos': 0, 'debugs': 0}
@@ -329,9 +414,9 @@ class LogAggregator:
                 breakdown[svc]['debugs'] += 1
         return breakdown
 
-    def search(self, query: str, max_results: int = 100) -> List[Dict[str, Any]]:
+    def search(self, query: str, max_results: int = 100) -> list[LogEntry]:
         query_lower = query.lower()
-        results = []
+        results: list[LogEntry] = []
         for entry in self.entries:
             if len(results) >= max_results:
                 break
@@ -340,7 +425,7 @@ class LogAggregator:
                 results.append(entry)
         return results
 
-    def export_csv(self, output_path: str, max_entries: int = 10000):
+    def export_csv(self, output_path: str, max_entries: int = 10000) -> None:
         fields = ['timestamp', 'level', 'service', 'message']
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -349,7 +434,7 @@ class LogAggregator:
                 writer.writerow(entry)
         logger.info(f"Exported {min(len(self.entries), max_entries)} entries to {output_path}")
 
-    def export_json(self, output_path: str):
+    def export_json(self, output_path: str) -> None:
         with open(output_path, 'w') as f:
             json.dump({
                 'summary': self.get_summary(),
@@ -359,7 +444,7 @@ class LogAggregator:
             }, f, indent=2, default=str)
         logger.info(f"Report exported to {output_path}")
 
-    def generate_html_report(self, output_path: str):
+    def generate_html_report(self, output_path: str) -> None:
         summary = self.get_summary()
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -404,7 +489,7 @@ th {{ background: #1e293b; color: #94a3b8; }}
         logger.info(f"HTML report generated at {output_path}")
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Log aggregator and analysis tool")
     parser.add_argument("--input", "-i", help="Input log file or glob pattern")
     parser.add_argument("--dir", help="Directory containing log files")
@@ -415,7 +500,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -445,9 +530,12 @@ def main():
             print(f"  ... and {len(results) - 20} more")
 
     summary = aggregator.get_summary()
+    time_range = summary.get('time_range')
+    range_start = time_range.get('start', 'N/A') if time_range else 'N/A'
+    range_end = time_range.get('end', 'N/A') if time_range else 'N/A'
     print(f"\nSummary:")
     print(f"  Total entries: {summary['total_entries']:,}")
-    print(f"  Time range: {summary.get('time_range', {}).get('start', 'N/A')} to {summary.get('time_range', {}).get('end', 'N/A')}")
+    print(f"  Time range: {range_start} to {range_end}")
     print(f"  Error rate: {summary.get('error_rate', 0)}%")
     print(f"  By level: {', '.join(f'{k}={v}' for k, v in summary.get('by_level', {}).items())}")
     print(f"  By service: {', '.join(f'{k}={v}' for k, v in summary.get('by_service', {}).items())}")
