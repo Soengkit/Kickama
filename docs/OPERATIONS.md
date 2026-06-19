@@ -85,6 +85,32 @@ Alerts are sent to PagerDuty and Slack (#ops-alerts channel).
 | DBConnectionPool | Pool exhaustion risk | Critical | 10 minutes |
 | QueueBacklog | Queue depth > 10000 for 5 minutes | Warning | 15 minutes |
 
+## Deployment Dry Run
+
+The legacy deploy helper supports a dry-run mode for reviewing deployment and
+rollback steps before any remote operation is attempted:
+
+```bash
+python3 tools/deploy.py --env staging --service backend --tag v3.2.0 --dry-run
+```
+
+To preview a rollback:
+
+```bash
+python3 tools/deploy.py --env production --service backend --rollback --version v3.1.0 --dry-run
+```
+
+Dry-run mode prints the target host, Kubernetes namespace, context, services,
+version, each command that would run, target objects, files that would be read
+or written, and the environment variable names visible to child commands. It
+does not execute build, Docker, kubectl, curl, or other shell commands, does not
+open network connections, and does not write deployment history.
+
+Environment variable values are not printed. Variables with names containing
+`TOKEN`, `SECRET`, `KEY`, or `PASSWORD` are shown as `<redacted>`; other set
+variables are shown as `<set>`. The final summary line reports how many actions
+would have run.
+
 ## Incident Response
 
 ### Severity Levels

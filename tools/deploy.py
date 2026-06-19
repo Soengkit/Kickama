@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,7 @@ ENVIRONMENTS = {
 }
 
 ROLLBACK_VERSIONS: Dict[str, List[str]] = {}
+SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "KEY", "PASSWORD")
 
 
 def load_deployment_history(env: str) -> List[Dict]:
@@ -123,6 +125,200 @@ def load_deployment_history(env: str) -> List[Dict]:
 def save_deployment_history(env: str, history: List[Dict]):
     with open(f".deploy_history_{env}.json", "w") as f:
         json.dump(history, f, indent=2)
+
+
+def command_text(cmd: List[str]) -> str:
+    return shlex.join(cmd)
+
+
+def file_status(path: str) -> str:
+    status = "exists" if Path(path).exists() else "missing"
+    return f"{path} ({status})"
+
+
+def redact_env_value(name: str, value: Optional[str]) -> str:
+    if value is None:
+        return "<unset>"
+    if any(marker in name.upper() for marker in SECRET_ENV_MARKERS):
+        return "<redacted>"
+    return "<set>"
+
+
+def inherited_environment() -> List[str]:
+    names = set(os.environ)
+    names.add("USER")
+    return [f"{name}={redact_env_value(name, os.environ.get(name))}"
+            for name in sorted(names)]
+
+
+def add_dry_run_action(actions: List[Dict], service: str, action: str,
+                       target: str, command: Optional[List[str]] = None,
+                       file: Optional[str] = None,
+                       note: Optional[str] = None):
+    actions.append({
+        "service": service,
+        "action": action,
+        "target": target,
+        "command": command_text(command) if command else None,
+        "file": file_status(file) if file else None,
+        "note": note,
+    })
+
+
+def service_dry_run_actions(service: str, env: str, tag: str,
+                            skip_build: bool = False,
+                            skip_test: bool = False,
+                            skip_health: bool = False,
+                            include_history: bool = True) -> List[Dict]:
+    actions: List[Dict] = []
+    env_config = ENVIRONMENTS[env]
+    service_config = SERVICES[service]
+    namespace = env_config["namespace"]
+    kube_context = env_config["kube_context"]
+    replicas = service_config["replicas"].get(env, 1)
+    local_image = f"tent/{service}:{tag}"
+    remote_image = f"registry.example.com/tent/{service}:{tag}"
+    deployment = f"deployment/{service_config['name']}"
+    manifest_file = f"deploy/k8s/{service}.yaml"
+    history_file = f".deploy_history_{env}.json"
+
+    if not skip_build:
+        add_dry_run_action(
+            actions,
+            service,
+            "build service",
+            f"{service} ({service_config['language']})",
+            ["sh", "-c", service_config["build_command"]],
+            service_config["build_path"],
+            "Build artifact path shown; no build command is executed.",
+        )
+
+    if not skip_test:
+        add_dry_run_action(
+            actions,
+            service,
+            "run tests",
+            service,
+            ["sh", "-c", service_config["test_command"]],
+        )
+
+    add_dry_run_action(
+        actions,
+        service,
+        "build docker image",
+        local_image,
+        ["docker", "build", "-t", local_image, "-f", service_config["dockerfile"], "."],
+        service_config["dockerfile"],
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "tag docker image",
+        remote_image,
+        ["docker", "tag", local_image, remote_image],
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "push docker image",
+        remote_image,
+        ["docker", "push", remote_image],
+        note="Dry-run prints this remote action only; no registry connection is opened.",
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "apply kubernetes manifest",
+        f"{namespace} on {kube_context}",
+        ["kubectl", "apply", "-f", manifest_file, "-n", namespace, "--context", kube_context],
+        manifest_file,
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "set kubernetes image",
+        f"{deployment} -> {remote_image}",
+        [
+            "kubectl", "set", "image", deployment,
+            f"{service}={remote_image}", "-n", namespace, "--context", kube_context,
+        ],
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "scale kubernetes deployment",
+        f"{deployment} replicas={replicas}",
+        [
+            "kubectl", "scale", deployment, f"--replicas={replicas}",
+            "-n", namespace, "--context", kube_context,
+        ],
+    )
+    add_dry_run_action(
+        actions,
+        service,
+        "wait for kubernetes rollout",
+        deployment,
+        [
+            "kubectl", "rollout", "status", deployment, "-n", namespace,
+            "--context", kube_context, "--timeout=300s",
+        ],
+    )
+
+    if not skip_health:
+        url = (
+            f"http://{env_config['host']}:{service_config['port']}"
+            f"{service_config['health_endpoint']}"
+        )
+        add_dry_run_action(
+            actions,
+            service,
+            "run health check",
+            url,
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", url],
+            note="Dry-run prints this network check only; no HTTP connection is opened.",
+        )
+
+    if include_history:
+        add_dry_run_action(
+            actions,
+            service,
+            "record deployment history",
+            history_file,
+            file=history_file,
+            note="Dry-run prints the local file that would be written but does not write it.",
+        )
+    return actions
+
+
+def print_dry_run_plan(env: str, services: List[str], tag: str,
+                       actions: List[Dict], rollback_version: Optional[str] = None):
+    env_config = ENVIRONMENTS[env]
+    mode = "rollback" if rollback_version else "deploy"
+    print(f"Dry-run {mode} plan")
+    print(f"Environment: {env}")
+    print(f"Target host: {env_config['host']}")
+    print(f"Namespace: {env_config['namespace']}")
+    print(f"Kubernetes context: {env_config['kube_context']}")
+    print(f"Services: {', '.join(services)}")
+    print(f"Version/tag: {rollback_version or tag}")
+    print("Dry-run safety: no commands are executed, no network connections are opened, and no state is written.")
+    print()
+    print("Environment variable names visible to child commands:")
+    for entry in inherited_environment():
+        print(f"  {entry}")
+    print()
+    print("Planned actions:")
+    for index, action in enumerate(actions, start=1):
+        print(f"{index}. [{action['service']}] {action['action']}")
+        print(f"   target: {action['target']}")
+        if action["command"]:
+            print(f"   command: {action['command']}")
+        if action["file"]:
+            print(f"   file: {action['file']}")
+        if action["note"]:
+            print(f"   note: {action['note']}")
+    print()
+    print(f"Dry-run summary: {len(actions)} actions would have run.")
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +600,17 @@ def main():
             return 1
 
         if args.dry_run:
-            print(f"Would rollback {args.service} in {args.env} to {args.version}")
+            actions = service_dry_run_actions(
+                args.service,
+                args.env,
+                args.version,
+                skip_build=True,
+                skip_test=True,
+                skip_health=False,
+                include_history=False,
+            )
+            print_dry_run_plan(args.env, [args.service], args.version, actions,
+                               rollback_version=args.version)
             return 0
 
         success = rollback_service(args.service, args.env, args.version)
@@ -413,10 +619,17 @@ def main():
     services = list(SERVICES.keys()) if args.service == "all" else [args.service]
 
     if args.dry_run:
-        print(f"Would deploy to {args.env}:")
+        actions: List[Dict] = []
         for s in services:
-            print(f"  {s}: tag={args.tag}, build={not args.skip_build}, "
-                  f"test={not args.skip_test}")
+            actions.extend(service_dry_run_actions(
+                s,
+                args.env,
+                args.tag,
+                args.skip_build,
+                args.skip_test,
+                args.skip_health,
+            ))
+        print_dry_run_plan(args.env, services, args.tag, actions)
         return 0
 
     all_successful = True
