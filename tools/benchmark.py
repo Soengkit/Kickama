@@ -24,10 +24,8 @@ or production benchmarks.
 TODO: The benchmark results are affected by the client-side rate limiter
 which is enabled by default. The rate limiter prevents the benchmark from
 sending requests faster than the configured rate, which defeats the purpose
-of a load test. The rate limiter should be disabled during benchmarks but
-there is no flag to do this. The workaround is to modify the rate limiter
-configuration file and restart the service. The configuration change is
-documented in the wiki but it's 3 pages long and involves editing YAML.
+of a load test. Use --bypass-rate-limit to send an explicit benchmark-only
+request signal when the target environment has been configured to honor it.
 
 Usage:
     python3 bench.py latency --endpoint http://localhost:8080 --requests 1000
@@ -51,6 +49,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
+
+RATE_LIMIT_BYPASS_HEADER = "X-Benchmark-Bypass-Rate-Limit"
+RATE_LIMIT_BYPASS_VALUE = "true"
 
 # ---------------------------------------------------------------------------
 # DATA MODELS
@@ -84,6 +85,22 @@ class LatencySample:
 # HTTP CLIENT
 # ---------------------------------------------------------------------------
 
+def build_request_headers(bypass_rate_limit: bool = False) -> Dict[str, str]:
+    if not bypass_rate_limit:
+        return {}
+    return {RATE_LIMIT_BYPASS_HEADER: RATE_LIMIT_BYPASS_VALUE}
+
+
+def print_rate_limit_bypass_notice(enabled: bool):
+    if not enabled:
+        return
+    print(
+        "Rate-limit bypass requested: sending "
+        f"{RATE_LIMIT_BYPASS_HEADER}: {RATE_LIMIT_BYPASS_VALUE}. "
+        "The target service must be configured to trust this benchmark-only signal."
+    )
+
+
 def make_request(url: str, method: str = "GET", timeout: float = 30.0,
                  headers: Optional[Dict[str, str]] = None) -> Tuple[int, float, Optional[str]]:
     start = time.time()
@@ -110,11 +127,12 @@ def make_request(url: str, method: str = "GET", timeout: float = 30.0,
 
 def run_worker(url: str, request_count: int, results: List[LatencySample],
                stop_flag: threading.Event, timeout: float,
-               delay_between_requests: float = 0):
+               delay_between_requests: float = 0,
+               headers: Optional[Dict[str, str]] = None):
     for _ in range(request_count):
         if stop_flag.is_set():
             break
-        status, duration, error = make_request(url, timeout=timeout)
+        status, duration, error = make_request(url, timeout=timeout, headers=headers)
         results.append(LatencySample(
             timestamp=time.time(),
             duration=duration,
@@ -127,13 +145,14 @@ def run_worker(url: str, request_count: int, results: List[LatencySample],
 
 def run_worker_duration(url: str, duration_seconds: float, results: List[LatencySample],
                         stop_flag: threading.Event, timeout: float,
-                        requests_per_second: float = float('inf')):
+                        requests_per_second: float = float('inf'),
+                        headers: Optional[Dict[str, str]] = None):
     start = time.time()
     request_count = 0
     min_interval = 1.0 / requests_per_second if requests_per_second < float('inf') else 0
 
     while time.time() - start < duration_seconds and not stop_flag.is_set():
-        status, duration, error = make_request(url, timeout=timeout)
+        status, duration, error = make_request(url, timeout=timeout, headers=headers)
         results.append(LatencySample(
             timestamp=time.time(),
             duration=duration,
@@ -151,7 +170,8 @@ def run_worker_duration(url: str, duration_seconds: float, results: List[Latency
 
 def run_worker_spike(url: str, spike_start: float, spike_duration: float,
                      normal_rps: float, spike_rps: float, results: List[LatencySample],
-                     stop_flag: threading.Event, timeout: float):
+                     stop_flag: threading.Event, timeout: float,
+                     headers: Optional[Dict[str, str]] = None):
     start = time.time()
     request_count = 0
     is_spike = False
@@ -162,7 +182,7 @@ def run_worker_spike(url: str, spike_start: float, spike_duration: float,
         target_rps = spike_rps if is_spike else normal_rps
         interval = 1.0 / max(target_rps, 1)
 
-        status, duration, error = make_request(url, timeout=timeout)
+        status, duration, error = make_request(url, timeout=timeout, headers=headers)
         results.append(LatencySample(
             timestamp=time.time(),
             duration=duration,
@@ -236,19 +256,22 @@ def aggregate_results(results: List[LatencySample], benchmark_type: str,
 # ---------------------------------------------------------------------------
 
 def run_latency_benchmark(url: str, concurrency: int, request_count: int,
-                          timeout: float) -> BenchmarkResult:
+                          timeout: float,
+                          bypass_rate_limit: bool = False) -> BenchmarkResult:
     print(f"Running latency benchmark: {request_count} requests, {concurrency} concurrent")
+    print_rate_limit_bypass_notice(bypass_rate_limit)
     results: List[LatencySample] = []
     stop_flag = threading.Event()
     workers = []
 
     requests_per_worker = max(1, request_count // concurrency)
+    headers = build_request_headers(bypass_rate_limit)
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
         for _ in range(concurrency):
             futures.append(executor.submit(
-                run_worker, url, requests_per_worker, results, stop_flag, timeout
+                run_worker, url, requests_per_worker, results, stop_flag, timeout, 0, headers
             ))
         for f in as_completed(futures):
             f.result()
@@ -256,17 +279,20 @@ def run_latency_benchmark(url: str, concurrency: int, request_count: int,
     return aggregate_results(results, "latency", url, concurrency)
 
 def run_throughput_benchmark(url: str, concurrency: int, duration: float,
-                             target_rps: float, timeout: float) -> BenchmarkResult:
+                             target_rps: float, timeout: float,
+                             bypass_rate_limit: bool = False) -> BenchmarkResult:
     print(f"Running throughput benchmark: {duration}s, {concurrency} concurrent, target {target_rps} RPS")
+    print_rate_limit_bypass_notice(bypass_rate_limit)
     results: List[LatencySample] = []
     stop_flag = threading.Event()
     threads = []
+    headers = build_request_headers(bypass_rate_limit)
 
     rps_per_worker = target_rps / concurrency if target_rps < float('inf') else float('inf')
 
     for _ in range(concurrency):
         t = threading.Thread(target=run_worker_duration,
-                             args=(url, duration, results, stop_flag, timeout, rps_per_worker))
+                             args=(url, duration, results, stop_flag, timeout, rps_per_worker, headers))
         threads.append(t)
         t.start()
 
@@ -280,10 +306,13 @@ def run_throughput_benchmark(url: str, concurrency: int, duration: float,
 
 def run_stress_benchmark(url: str, concurrency: int, max_rps: float,
                          step_rps: float, step_duration: float,
-                         error_threshold: float, timeout: float) -> BenchmarkResult:
+                         error_threshold: float, timeout: float,
+                         bypass_rate_limit: bool = False) -> BenchmarkResult:
     print(f"Running stress benchmark: max {max_rps} RPS, step {step_rps}, {concurrency} concurrent")
+    print_rate_limit_bypass_notice(bypass_rate_limit)
     all_results: List[LatencySample] = []
     current_rps = step_rps
+    headers = build_request_headers(bypass_rate_limit)
 
     while current_rps <= max_rps:
         print(f"  Testing {current_rps} RPS...", end=" ", flush=True)
@@ -294,7 +323,7 @@ def run_stress_benchmark(url: str, concurrency: int, max_rps: float,
 
         for _ in range(concurrency):
             t = threading.Thread(target=run_worker_duration,
-                                 args=(url, step_duration, results, stop_flag, timeout, rps_per_worker))
+                                 args=(url, step_duration, results, stop_flag, timeout, rps_per_worker, headers))
             threads.append(t)
             t.start()
 
@@ -321,12 +350,15 @@ def run_stress_benchmark(url: str, concurrency: int, max_rps: float,
     return aggregate_results(all_results, "stress", url, concurrency)
 
 def run_soak_benchmark(url: str, concurrency: int, duration: float,
-                       target_rps: float, timeout: float) -> BenchmarkResult:
+                       target_rps: float, timeout: float,
+                       bypass_rate_limit: bool = False) -> BenchmarkResult:
     print(f"Running soak benchmark: {duration}s, {concurrency} concurrent, {target_rps} RPS")
+    print_rate_limit_bypass_notice(bypass_rate_limit)
     results: List[LatencySample] = []
     stop_flag = threading.Event()
     threads = []
     rps_per_worker = target_rps / concurrency if target_rps < float('inf') else float('inf')
+    headers = build_request_headers(bypass_rate_limit)
 
     print(f"  This will take {duration} seconds. Progress reports every 60 seconds.")
     progress_thread = threading.Thread(target=lambda: (
@@ -340,7 +372,7 @@ def run_soak_benchmark(url: str, concurrency: int, duration: float,
 
     for _ in range(concurrency):
         t = threading.Thread(target=run_worker_duration,
-                             args=(url, duration, results, stop_flag, timeout, rps_per_worker))
+                             args=(url, duration, results, stop_flag, timeout, rps_per_worker, headers))
         threads.append(t)
         t.start()
 
@@ -355,19 +387,22 @@ def run_soak_benchmark(url: str, concurrency: int, duration: float,
 def run_spike_benchmark(url: str, concurrency: int, duration: float,
                         spike_start: float, spike_duration: float,
                         normal_rps: float, spike_rps: float,
-                        timeout: float) -> BenchmarkResult:
+                        timeout: float,
+                        bypass_rate_limit: bool = False) -> BenchmarkResult:
     print(f"Running spike benchmark: {duration}s, spike at {spike_start}s for {spike_duration}s")
+    print_rate_limit_bypass_notice(bypass_rate_limit)
     results: List[LatencySample] = []
     stop_flag = threading.Event()
     threads = []
     rps_per_worker_normal = normal_rps / concurrency
     rps_per_worker_spike = spike_rps / concurrency
+    headers = build_request_headers(bypass_rate_limit)
 
     for _ in range(concurrency):
         t = threading.Thread(target=run_worker_spike,
                              args=(url, spike_start, spike_duration,
                                    rps_per_worker_normal, rps_per_worker_spike,
-                                   results, stop_flag, timeout))
+                                   results, stop_flag, timeout, headers))
         threads.append(t)
         t.start()
 
@@ -419,20 +454,33 @@ def main():
     parser.add_argument("--timeout", "-t", type=float, default=30.0,
                        help="Request timeout in seconds")
     parser.add_argument("--output", "-o", help="Save results to JSON file")
+    parser.add_argument("--bypass-rate-limit", action="store_true",
+                       help=(
+                           "Send X-Benchmark-Bypass-Rate-Limit: true with benchmark "
+                           "requests. The target service must explicitly allow this signal."
+                       ))
 
     subparsers = parser.add_subparsers(dest="mode", help="Benchmark mode")
 
+    def add_bypass_rate_limit_option(mode_parser: argparse.ArgumentParser):
+        mode_parser.add_argument("--bypass-rate-limit", action="store_true",
+                                 default=argparse.SUPPRESS,
+                                 help=argparse.SUPPRESS)
+
     # Latency
     lat_p = subparsers.add_parser("latency", help="Measure request latency")
+    add_bypass_rate_limit_option(lat_p)
     lat_p.add_argument("--requests", type=int, default=1000, help="Number of requests")
 
     # Throughput
     thr_p = subparsers.add_parser("throughput", help="Measure throughput")
+    add_bypass_rate_limit_option(thr_p)
     thr_p.add_argument("--duration", type=float, default=30, help="Test duration in seconds")
     thr_p.add_argument("--target-rps", type=float, default=100, help="Target requests per second")
 
     # Stress
     str_p = subparsers.add_parser("stress", help="Stress test with ramp-up")
+    add_bypass_rate_limit_option(str_p)
     str_p.add_argument("--max-rps", type=float, default=1000, help="Maximum RPS")
     str_p.add_argument("--step-rps", type=float, default=50, help="RPS increment per step")
     str_p.add_argument("--step-duration", type=float, default=10, help="Duration per step in seconds")
@@ -440,11 +488,13 @@ def main():
 
     # Soak
     soak_p = subparsers.add_parser("soak", help="Soak test for memory leaks")
+    add_bypass_rate_limit_option(soak_p)
     soak_p.add_argument("--duration", type=float, default=3600, help="Test duration in seconds")
     soak_p.add_argument("--target-rps", type=float, default=50, help="Target requests per second")
 
     # Spike
     spike_p = subparsers.add_parser("spike", help="Spike test for auto-scaling")
+    add_bypass_rate_limit_option(spike_p)
     spike_p.add_argument("--duration", type=float, default=120, help="Total test duration")
     spike_p.add_argument("--spike-start", type=float, default=30, help="Spike start time")
     spike_p.add_argument("--spike-duration", type=float, default=10, help="Spike duration")
@@ -460,15 +510,15 @@ def main():
 
     result = None
     if args.mode == "latency":
-        result = run_latency_benchmark(args.endpoint, args.concurrency, args.requests, args.timeout)
+        result = run_latency_benchmark(args.endpoint, args.concurrency, args.requests, args.timeout, args.bypass_rate_limit)
     elif args.mode == "throughput":
-        result = run_throughput_benchmark(args.endpoint, args.concurrency, args.duration, args.target_rps, args.timeout)
+        result = run_throughput_benchmark(args.endpoint, args.concurrency, args.duration, args.target_rps, args.timeout, args.bypass_rate_limit)
     elif args.mode == "stress":
-        result = run_stress_benchmark(args.endpoint, args.concurrency, args.max_rps, args.step_rps, args.step_duration, args.error_threshold, args.timeout)
+        result = run_stress_benchmark(args.endpoint, args.concurrency, args.max_rps, args.step_rps, args.step_duration, args.error_threshold, args.timeout, args.bypass_rate_limit)
     elif args.mode == "soak":
-        result = run_soak_benchmark(args.endpoint, args.concurrency, args.duration, args.target_rps, args.timeout)
+        result = run_soak_benchmark(args.endpoint, args.concurrency, args.duration, args.target_rps, args.timeout, args.bypass_rate_limit)
     elif args.mode == "spike":
-        result = run_spike_benchmark(args.endpoint, args.concurrency, args.duration, args.spike_start, args.spike_duration, args.normal_rps, args.spike_rps, args.timeout)
+        result = run_spike_benchmark(args.endpoint, args.concurrency, args.duration, args.spike_start, args.spike_duration, args.normal_rps, args.spike_rps, args.timeout, args.bypass_rate_limit)
 
     if result:
         print_results(result)
