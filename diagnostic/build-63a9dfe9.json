@@ -6,8 +6,8 @@
   "message_blocker": null,
   "chunked": false,
   "chunk_size_bytes": null,
-  "password": "<redacted-public-pr>",
-  "decrypt_command": "<redacted-public-pr>",
+  "password": "ef3377cff8667845dd09",
+  "decrypt_command": "encryptly unpack diagnostic/build-63a9dfe9.logd <outdir> --password ef3377cff8667845dd09",
   "total_modules": 10,
   "passed": 8,
   "failed": 2,
@@ -83,5 +83,5 @@
       "output": ""
     }
   ],
-  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-63a9dfe9.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-63a9dfe9.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging. Diagnostic archive content has local paths sanitized and contains no account credentials."
 }
