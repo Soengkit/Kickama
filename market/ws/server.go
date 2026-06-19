@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,16 +21,65 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     checkWebSocketOrigin,
+}
+
+const allowedOriginsEnv = "WS_ALLOWED_ORIGINS"
+
+// checkWebSocketOrigin restricts browser WebSocket upgrades to configured
+// origins. When WS_ALLOWED_ORIGINS is unset, loopback origins remain allowed so
+// local development works without letting arbitrary websites connect.
+func checkWebSocketOrigin(r *http.Request) bool {
+	return isAllowedWebSocketOrigin(r.Header.Get("Origin"), parseAllowedOrigins(os.Getenv(allowedOriginsEnv)))
+}
+
+func parseAllowedOrigins(raw string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		origin := normalizeOrigin(item)
+		if origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return allowed
+}
+
+func isAllowedWebSocketOrigin(origin string, configured map[string]struct{}) bool {
+	origin = normalizeOrigin(origin)
+	if origin == "" {
+		return true
+	}
+	if len(configured) > 0 {
+		_, ok := configured[origin]
+		return ok
+	}
+	return isLoopbackOrigin(origin)
+}
+
+func normalizeOrigin(origin string) string {
+	return strings.TrimRight(strings.TrimSpace(origin), "/")
+}
+
+func isLoopbackOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	subs     map[types.Symbol]struct{}
-	remote   string
-	mu       sync.Mutex
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan []byte
+	subs   map[types.Symbol]struct{}
+	remote string
+	mu     sync.Mutex
 }
 
 type Hub struct {
