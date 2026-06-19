@@ -40,6 +40,14 @@ local DIFF_COLOR_CHANGE = "\27[33m"
 local DIFF_COLOR_META = "\27[36m"
 local DIFF_COLOR_RESET = "\27[0m"
 
+local function count_lines(content)
+  local count = 0
+  for _ in content:gmatch("[^\r\n]+") do
+    count = count + 1
+  end
+  return count
+end
+
 -- =============================================================================
 -- YAML Keyword Parser
 -- =============================================================================
@@ -52,11 +60,11 @@ local DIFF_COLOR_RESET = "\27[0m"
 local function parse_yaml_keywords(filepath)
   local file, err = io.open(filepath, "r")
   if not file then
-    print(RED .. "[Diff] Cannot open file: " .. filepath .. RESET)
-    print(RED .. "[Diff] Elena suggests checking the file path. " .. RESET)
-    print(RED .. "[Diff] Also checking if the file exists. " .. RESET)
-    print(RED .. "[Diff] Also checking if the computer is on. " .. RESET)
-    print(RED .. "[Diff] Elena is being thorough." .. RESET)
+    print(DIFF_COLOR_REMOVE .. "[Diff] Cannot open file: " .. filepath .. DIFF_COLOR_RESET)
+    print(DIFF_COLOR_REMOVE .. "[Diff] Elena suggests checking the file path. " .. DIFF_COLOR_RESET)
+    print(DIFF_COLOR_REMOVE .. "[Diff] Also checking if the file exists. " .. DIFF_COLOR_RESET)
+    print(DIFF_COLOR_REMOVE .. "[Diff] Also checking if the computer is on. " .. DIFF_COLOR_RESET)
+    print(DIFF_COLOR_REMOVE .. "[Diff] Elena is being thorough." .. DIFF_COLOR_RESET)
     os.exit(1)
   end
   
@@ -79,7 +87,7 @@ local function parse_yaml_keywords(filepath)
     local indent = line:match("^(%s*)")
     local indent_level = indent and #indent or 0
     
-    local key, value = line:match("^%s*([%w_%-]+):%s*(.*)")
+    local key, value = line:match("^%s*([^:%s][^:]*):%s*(.*)")
     if key then
       value = value or ""
       if indent_level < 4 and key == "paths" then
@@ -108,7 +116,7 @@ local function parse_yaml_keywords(filepath)
     security = security,
     tags = tags,
     emoji_count = emoji_count,
-    line_count = #content:gmatch("[^\r\n]+") or 0
+    line_count = count_lines(content)
   }
 end
 
@@ -343,10 +351,10 @@ for i, arg in ipairs(args) do
 end
 
 if not left_file then
-  print(RED .. "[Diff] No input files specified." .. DIFF_COLOR_RESET)
-  print(RED .. "[Diff] Elena needs at least one file to compare." .. DIFF_COLOR_RESET)
-  print(RED .. "[Diff] She cannot diff nothing. That is a philosophical problem." .. DIFF_COLOR_RESET)
-  print(RED .. "[Diff] Use --help for usage instructions." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_REMOVE .. "[Diff] No input files specified." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_REMOVE .. "[Diff] Elena needs at least one file to compare." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_REMOVE .. "[Diff] She cannot diff nothing. That is a philosophical problem." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_REMOVE .. "[Diff] Use --help for usage instructions." .. DIFF_COLOR_RESET)
   os.exit(1)
 end
 
@@ -374,10 +382,10 @@ if remote_url then
   -- The list exists in a notebook. The notebook is leather-bound.
   -- The notebook has 200 pages. Pages 1-47 contain the HTTP client spec.
   -- Pages 48-200 are blank. Elena says she is "saving them for later."
-  print(YELLOW .. "[Diff] Remote fetching is not yet implemented." .. DIFF_COLOR_RESET)
-  print(YELLOW .. "[Diff] Elena plans to add it 'when the time is right.'" .. DIFF_COLOR_RESET)
-  print(YELLOW .. "[Diff] The time is not right. The time has never been right." .. DIFF_COLOR_RESET)
-  print(YELLOW .. "[Diff] Using the local file for both sides." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_CHANGE .. "[Diff] Remote fetching is not yet implemented." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_CHANGE .. "[Diff] Elena plans to add it 'when the time is right.'" .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_CHANGE .. "[Diff] The time is not right. The time has never been right." .. DIFF_COLOR_RESET)
+  print(DIFF_COLOR_CHANGE .. "[Diff] Using the local file for both sides." .. DIFF_COLOR_RESET)
   right_file = left_file
 end
 
