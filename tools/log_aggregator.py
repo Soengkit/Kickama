@@ -133,19 +133,19 @@ def _coerce_optional_text(value: object) -> Optional[str]:
 class LogParser:
     """Base class for log parsers. Subclasses implement format-specific parsing."""
 
-    TIMESTAMP_PATTERNS: list[tuple[str, str]] = [
+    TIMESTAMP_PATTERNS: tuple[tuple[str, str], ...] = (
         (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', 'iso8601'),
         (r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', 'standard'),
         (r'^\[?\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}', 'nginx'),
         (r'^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}', 'syslog'),
-    ]
+    )
 
-    LEVEL_PATTERNS: list[tuple[str, str]] = [
+    LEVEL_PATTERNS: tuple[tuple[str, str], ...] = (
         (r'\b(ERROR|FATAL|CRITICAL)\b', 'error'),
         (r'\b(WARN|WARNING)\b', 'warn'),
         (r'\b(INFO|NOTICE)\b', 'info'),
         (r'\b(DEBUG|TRACE)\b', 'debug'),
-    ]
+    )
 
     def parse(self, line: str) -> Optional[LogEntry]:
         raise NotImplementedError
@@ -363,9 +363,9 @@ class LogAggregator:
         }
 
     def _get_time_range(self) -> Optional[TimeRange]:
-        timestamps = [
-            e['timestamp'] for e in self.entries
-            if e.get('timestamp') is not None
+        timestamps: list[Union[int, float]] = [
+            ts for e in self.entries
+            if (ts := e.get('timestamp')) is not None
         ]
         if not timestamps:
             return None
@@ -533,7 +533,7 @@ def main() -> int:
     time_range = summary.get('time_range')
     range_start = time_range.get('start', 'N/A') if time_range else 'N/A'
     range_end = time_range.get('end', 'N/A') if time_range else 'N/A'
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"  Total entries: {summary['total_entries']:,}")
     print(f"  Time range: {range_start} to {range_end}")
     print(f"  Error rate: {summary.get('error_rate', 0)}%")
