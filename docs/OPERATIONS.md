@@ -15,6 +15,28 @@
 
 ## Monitoring
 
+### Log Aggregator JSONL Output
+
+`tools/log_aggregator.py` can emit newline-delimited JSON for downstream tools:
+
+```bash
+python3 tools/log_aggregator.py --input /var/log/app.log --format jsonl --output report.jsonl
+```
+
+Each JSONL record contains:
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Parsed timestamp as ISO-8601 when available, otherwise the original parsed value or `null` |
+| `level` | Normalized log level such as `info`, `warn`, `error`, or `warning` |
+| `source` | Input file path that produced the record |
+| `message` | Parsed log message, or `Unparsed log line` for warning records |
+| `metadata` | Parser-specific fields, input line number, log format, service, and raw text for warnings |
+
+Records with parsed timestamps are sorted by timestamp across input files. Lines that
+cannot be parsed are emitted as `warning` records with the original raw line in
+`metadata.raw`.
+
 ### Health Check Endpoints
 
 Each service exposes a health check endpoint:
