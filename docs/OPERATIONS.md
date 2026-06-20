@@ -310,3 +310,34 @@ Audit logs are retained for 365 days and include:
 2. Update Kubernetes secret: `kubectl create secret tls tot-tls --cert=new.crt --key=new.key -n tent-production --dry-run=client -o yaml | kubectl apply -f -`
 3. Restart services: `kubectl rollout restart deployment -n tent-production`
 4. Verify new certificate: `openssl s_client -connect api.example.com:443 -servername api.example.com`
+
+### Log Aggregator Redaction Summary
+
+Security reviewers can run the legacy log aggregator with JSON output to get
+a compact audit summary of processed, malformed, and redacted fields by source
+file:
+
+```bash
+python3 tools/log_aggregator.py \
+  --input tools/fixtures/log_aggregator/redaction_sample.log \
+  --output /tmp/log_report.json \
+  --format json
+```
+
+The console summary includes redaction counters without exposing raw secret
+values:
+
+```text
+Summary:
+  Total entries: 4
+  Processed lines: 5
+  Malformed lines: 1
+  Redacted fields: 4
+  Sources:
+    redaction_sample.log: processed=5, malformed=1, redacted_fields=4
+```
+
+JSON and HTML reports include the same `summary.processed`,
+`summary.malformed`, `summary.redacted_fields`, and per-source `summary.sources`
+fields. Existing `total_entries`, `by_level`, `by_service`, and `entries`
+fields remain available for downstream consumers.
