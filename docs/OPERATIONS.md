@@ -58,6 +58,22 @@ Key metrics to monitor:
 | `goroutine_count` | Gauge | Go routine count | > 5000 | > 10000 |
 | `gc_pause_time_ms` | Histogram | GC pause time | > 100ms | > 500ms |
 
+### Health Check Prometheus Stale Guard
+
+The legacy health check tool can emit Prometheus text output and flag stale
+health metric timestamps before export:
+
+```bash
+python3 tools/health_check.py --prometheus --environment production --stale-threshold-seconds 300
+python3 tools/health_check.py --json --environment production --stale-threshold-seconds 300
+```
+
+Prometheus output includes `tent_health_metric_stale` and
+`tent_health_metric_age_seconds` for each emitted service, infrastructure, and
+system health metric. JSON output includes the same stale status in the
+`stale_metrics` array. Secret-looking diagnostic values are redacted before
+export.
+
 ### Grafana Dashboards
 
 Pre-built Grafana dashboards are available:

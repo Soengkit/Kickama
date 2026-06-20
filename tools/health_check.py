@@ -33,12 +33,13 @@ Usage:
 import argparse
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -64,9 +65,56 @@ DISK_THRESHOLD_CRITICAL = 90
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
+DEFAULT_STALE_THRESHOLD_SECONDS = 300
+SECRET_KEY_PATTERN = re.compile(r"(token|secret|password|credential|key)", re.IGNORECASE)
+SECRET_VALUE_PATTERN = re.compile(
+    r"(?i)\b(bearer|basic|token|password|secret|api[_-]?key)=([^\s,;]+)"
+)
+
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
+
+def redact_value(key: str, value):
+    if value is None:
+        return value
+    if SECRET_KEY_PATTERN.search(key):
+        return "[REDACTED]"
+    if isinstance(value, str):
+        return SECRET_VALUE_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    if isinstance(value, dict):
+        return {k: redact_value(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(key, item) for item in value]
+    return value
+
+
+def parse_timestamp(value: str) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def metric_age_seconds(timestamp: str, now: Optional[datetime] = None) -> Optional[float]:
+    parsed = parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0.0, (current - parsed).total_seconds())
+
+
+def stale_status(timestamp: str, threshold_seconds: int,
+                 now: Optional[datetime] = None) -> Tuple[bool, Optional[float]]:
+    age = metric_age_seconds(timestamp, now)
+    if age is None:
+        return True, None
+    return age > threshold_seconds, age
 
 def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
     import http.client
@@ -274,6 +322,65 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     return results
 
 
+def health_metric_rows(results: Dict[str, Any], environment: str,
+                       stale_threshold_seconds: int,
+                       now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    timestamp = results.get("timestamp", "")
+    is_stale, age = stale_status(timestamp, stale_threshold_seconds, now)
+    rows: List[Dict[str, Any]] = []
+
+    def add_row(service_name: str, metric_name: str, status: str, detail: str):
+        rows.append(redact_value("", {
+            "service": service_name,
+            "environment": environment,
+            "metric_name": metric_name,
+            "timestamp": timestamp,
+            "status": status,
+            "stale": is_stale,
+            "age_seconds": age,
+            "detail": detail,
+        }))
+
+    for name, check in results.get("services", {}).items():
+        add_row(name, "health_status", check.get("status", "UNKNOWN"), check.get("detail", ""))
+    for name, check in results.get("infrastructure", {}).items():
+        add_row(name, "health_status", check.get("status", "UNKNOWN"), check.get("detail", ""))
+    for name, check in results.get("system", {}).items():
+        add_row(name, "health_status", check.get("status", "UNKNOWN"), check.get("detail", ""))
+
+    return rows
+
+
+def prometheus_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def status_value(status: str) -> int:
+    return {"OK": 1, "WARNING": 2, "CRITICAL": 3}.get(status, 0)
+
+
+def render_prometheus_metrics(rows: List[Dict[str, Any]]) -> str:
+    lines = [
+        "# HELP tent_health_status Health check status value: OK=1, WARNING=2, CRITICAL=3, UNKNOWN=0",
+        "# TYPE tent_health_status gauge",
+        "# HELP tent_health_metric_stale Whether the health metric timestamp is stale",
+        "# TYPE tent_health_metric_stale gauge",
+        "# HELP tent_health_metric_age_seconds Age of the health metric timestamp in seconds",
+        "# TYPE tent_health_metric_age_seconds gauge",
+    ]
+    for row in rows:
+        labels = (
+            f'service="{prometheus_escape(row["service"])}",'
+            f'environment="{prometheus_escape(row["environment"])}",'
+            f'metric_name="{prometheus_escape(row["metric_name"])}"'
+        )
+        lines.append(f"tent_health_status{{{labels}}} {status_value(row['status'])}")
+        lines.append(f"tent_health_metric_stale{{{labels}}} {1 if row['stale'] else 0}")
+        if row["age_seconds"] is not None:
+            lines.append(f"tent_health_metric_age_seconds{{{labels}}} {row['age_seconds']:.3f}")
+    return "\n".join(lines) + "\n"
+
+
 def print_health_report(results: Dict[str, Any]):
     print(f"\n{'='*60}")
     print(f"  HEALTH CHECK REPORT")
@@ -304,6 +411,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Health check tool")
     parser.add_argument("--service", "-s", help="Check specific service only")
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    parser.add_argument("--prometheus", action="store_true", help="Prometheus text output")
+    parser.add_argument("--environment", default=os.environ.get("APP_ENV", "local"),
+                       help="Environment label for JSON and Prometheus health output")
+    parser.add_argument("--stale-threshold-seconds", type=int, default=DEFAULT_STALE_THRESHOLD_SECONDS,
+                       help="Age threshold before health metrics are marked stale")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
@@ -318,7 +430,16 @@ def main():
         try:
             while True:
                 results = run_health_checks(args.service, args.json)
-                if args.json:
+                if args.prometheus:
+                    rows = health_metric_rows(
+                        results, args.environment, args.stale_threshold_seconds
+                    )
+                    print(render_prometheus_metrics(rows))
+                elif args.json:
+                    results["environment"] = args.environment
+                    results["stale_metrics"] = health_metric_rows(
+                        results, args.environment, args.stale_threshold_seconds
+                    )
                     print(json.dumps(results, indent=2))
                 else:
                     print_health_report(results)
@@ -327,7 +448,17 @@ def main():
             print("\nMonitoring stopped")
     else:
         results = run_health_checks(args.service, args.json)
-        if args.json:
+        if args.prometheus:
+            rows = health_metric_rows(
+                results, args.environment, args.stale_threshold_seconds
+            )
+            output = render_prometheus_metrics(rows)
+            print(output, end="")
+        elif args.json:
+            results["environment"] = args.environment
+            results["stale_metrics"] = health_metric_rows(
+                results, args.environment, args.stale_threshold_seconds
+            )
             output = json.dumps(results, indent=2)
             print(output)
         else:
@@ -337,6 +468,8 @@ def main():
             with open(args.output, "w") as f:
                 if args.json:
                     json.dump(results, f, indent=2)
+                elif args.prometheus:
+                    f.write(output)
                 else:
                     json.dump(results, f, indent=2)
             print(f"Report saved to {args.output}")
