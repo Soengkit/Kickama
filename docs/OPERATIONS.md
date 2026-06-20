@@ -310,3 +310,22 @@ Audit logs are retained for 365 days and include:
 2. Update Kubernetes secret: `kubectl create secret tls tot-tls --cert=new.crt --key=new.key -n tent-production --dry-run=client -o yaml | kubectl apply -f -`
 3. Restart services: `kubectl rollout restart deployment -n tent-production`
 4. Verify new certificate: `openssl s_client -connect api.example.com:443 -servername api.example.com`
+
+### Prometheus Stale Metric Guard
+
+Health check JSON output can include a stale metric report for Prometheus text
+exposition files:
+
+```bash
+python3 tools/health_check.py \
+  --json \
+  --env staging \
+  --service backend \
+  --prometheus-metrics tools/fixtures/health_check/prometheus_metrics.prom \
+  --stale-after-seconds 300 \
+  --output /tmp/health-report.json
+```
+
+The `prometheus_stale_metrics` array includes service, environment, metric
+name, timestamp, age, and stale status. Secret-looking values in diagnostic
+labels are redacted before export.
