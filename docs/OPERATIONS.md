@@ -206,6 +206,27 @@ FROM pg_stat_activity
 WHERE state = 'idle' AND age > interval '1 hour';
 ```
 
+### Migration Status Audit
+
+Use the migration status command before applying migrations, after a failed
+migration run, and during handoff checks:
+
+```bash
+python3 tools/db_migration.py status
+python3 tools/db_migration.py status --json
+```
+
+The command reads the `_migrations` table when PostgreSQL is reachable. If the
+database cannot be reached from the current environment, it falls back to the
+repository migration registry so local operators still get a deterministic
+pending-migration view.
+
+The report is grouped into applied migrations, pending migrations, and state
+versions that are missing from the repository migration definitions. The command
+exits with status `0` when the state is consistent and status `1` when any
+applied version is missing from disk. Automation should parse the `--json`
+output and fail the run when `consistent` is `false`.
+
 ## Capacity Planning
 
 ### Resource Utilization

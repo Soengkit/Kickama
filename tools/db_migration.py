@@ -32,7 +32,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -49,6 +49,7 @@ DB_CONFIG = {
 }
 
 MIGRATION_TABLE = "_migrations"
+MIGRATION_FILENAME_RE = re.compile(r"^(?P<version>\d{14})_(?P<description>.+)\.(?P<type>sql|py)$")
 
 # ---------------------------------------------------------------------------
 # MIGRATION TRACKING
@@ -208,6 +209,180 @@ def get_migration_status() -> List[Dict[str, Any]]:
     return status
 
 
+def fetch_applied_versions(db_config: Dict[str, str] = DB_CONFIG) -> Optional[List[str]]:
+    cmd = [
+        "psql",
+        "-h", db_config["host"],
+        "-p", str(db_config["port"]),
+        "-d", db_config["name"],
+        "-U", db_config["user"],
+        "-t",
+        "-A",
+        "-c", f"SELECT version FROM {MIGRATION_TABLE} ORDER BY version;",
+    ]
+
+    psql_env = os.environ.copy()
+    if db_config.get("password"):
+        psql_env["PGPASSWORD"] = db_config["password"]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=psql_env)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _migration_record(
+    version: str,
+    description: str,
+    migration_type: str = "sql",
+    source: str = "registry",
+) -> Dict[str, Any]:
+    return {
+        "version": version,
+        "description": description,
+        "type": migration_type,
+        "source": source,
+    }
+
+
+def _description_from_filename(raw: str) -> str:
+    return raw.replace("_", " ").strip() or "migration file"
+
+
+def discover_migration_files(migrations_dir: str = MIGRATIONS_DIR) -> List[Dict[str, Any]]:
+    path = Path(migrations_dir)
+    if not path.exists():
+        return []
+
+    migrations = []
+    for file_path in sorted(path.iterdir(), key=lambda item: item.name):
+        if not file_path.is_file():
+            continue
+        match = MIGRATION_FILENAME_RE.match(file_path.name)
+        if not match:
+            continue
+        migrations.append(_migration_record(
+            match.group("version"),
+            _description_from_filename(match.group("description")),
+            match.group("type"),
+            source=str(file_path.relative_to(path.parent)),
+        ))
+    return migrations
+
+
+def build_status_report(
+    applied_versions: Optional[List[str]] = None,
+    migrations: Optional[List[Dict[str, Any]]] = None,
+    migration_files: Optional[List[Dict[str, Any]]] = None,
+    state_source: str = "registry",
+) -> Dict[str, Any]:
+    known_migrations = migrations if migrations is not None else get_migration_status()
+    file_migrations = migration_files if migration_files is not None else discover_migration_files()
+
+    definitions: Dict[str, Dict[str, Any]] = {}
+    for migration in known_migrations:
+        definitions[migration["version"]] = _migration_record(
+            migration["version"],
+            migration["description"],
+            migration.get("type", "sql"),
+            source="registry",
+        )
+    for migration in file_migrations:
+        definitions.setdefault(migration["version"], migration)
+
+    if applied_versions is None:
+        applied = {
+            migration["version"]
+            for migration in known_migrations
+            if migration.get("applied")
+        }
+    else:
+        applied = set(applied_versions)
+
+    missing_versions = sorted(applied - set(definitions))
+    known_versions = sorted(definitions)
+    applied_known = [version for version in known_versions if version in applied]
+    pending_versions = [version for version in known_versions if version not in applied]
+
+    def hydrate(version: str, state: str) -> Dict[str, Any]:
+        migration = definitions[version]
+        return {
+            "version": version,
+            "description": migration["description"],
+            "type": migration["type"],
+            "state": state,
+            "source": migration["source"],
+        }
+
+    missing = [
+        {
+            "version": version,
+            "description": "present in migration state but missing from repository definitions",
+            "type": "unknown",
+            "state": "missing_on_disk",
+            "source": "state",
+        }
+        for version in missing_versions
+    ]
+
+    report = {
+        "consistent": not missing,
+        "state_source": state_source,
+        "summary": {
+            "applied": len(applied_known),
+            "pending": len(pending_versions),
+            "missing_on_disk": len(missing),
+        },
+        "applied": [hydrate(version, "applied") for version in applied_known],
+        "pending": [hydrate(version, "pending") for version in pending_versions],
+        "missing_on_disk": missing,
+    }
+    return report
+
+
+def print_status_report(report: Dict[str, Any], json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(report, sort_keys=True))
+        return
+
+    print("\nMigration status:")
+    print(f"State source: {report['state_source']}")
+    print(
+        f"Applied: {report['summary']['applied']} | "
+        f"Pending: {report['summary']['pending']} | "
+        f"Missing on disk: {report['summary']['missing_on_disk']}"
+    )
+
+    def print_section(title: str, rows: List[Dict[str, Any]]) -> None:
+        print(f"\n{title}:")
+        if not rows:
+            print("  (none)")
+            return
+        print(f"  {'Version':<20} {'Type':<6} {'Description':<42} Source")
+        print("  " + "-" * 88)
+        for row in rows:
+            print(
+                f"  {row['version']:<20} {row['type']:<6} "
+                f"{row['description'][:42]:<42} {row['source']}"
+            )
+
+    print_section("Applied migrations", report["applied"])
+    print_section("Pending migrations", report["pending"])
+    print_section("State versions missing on disk", report["missing_on_disk"])
+
+    if not report["consistent"]:
+        print(
+            "\nInconsistent migration state: at least one applied version is not "
+            "present in the repository migration registry or migration files.",
+            file=sys.stderr,
+        )
+
+
 def run_all_migrations(dry_run: bool = False) -> bool:
     status = get_migration_status()
     pending = [m for m in status if not m["applied"]]
@@ -254,7 +429,11 @@ def create_migration(description: str) -> str:
     return version
 
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "status":
+        argv = ["--status", *argv[1:]]
+
     parser = argparse.ArgumentParser(description="Database migration tool")
     parser.add_argument("--up", action="store_true", help="Apply all pending migrations")
     parser.add_argument("--down", action="store_true", help="Rollback a migration")
@@ -262,19 +441,22 @@ def main():
     parser.add_argument("--status", action="store_true", help="Show migration status")
     parser.add_argument("--create", help="Create a new migration file")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
     parser.add_argument("--seed", action="store_true", help="Apply seed data")
     parser.add_argument("--env", default="development", help="Target environment")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.status:
-        status = get_migration_status()
-        print(f"\nMigration status:")
-        print(f"{'Version':<20} {'Description':<40} {'Status':<10}")
-        print("-" * 70)
-        for m in status:
-            status_str = "✓ Applied" if m["applied"] else "○ Pending"
-            print(f"{m['version']:<20} {m['description']:<40} {status_str:<10}")
-        return 0
+        applied_versions = fetch_applied_versions()
+        if applied_versions is None:
+            report = build_status_report(state_source="registry")
+        else:
+            report = build_status_report(
+                applied_versions=applied_versions,
+                state_source="database",
+            )
+        print_status_report(report, args.json)
+        return 0 if report["consistent"] else 1
 
     if args.up:
         success = run_all_migrations(args.dry_run)
@@ -300,4 +482,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
