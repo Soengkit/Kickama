@@ -85,6 +85,25 @@ Alerts are sent to PagerDuty and Slack (#ops-alerts channel).
 | DBConnectionPool | Pool exhaustion risk | Critical | 10 minutes |
 | QueueBacklog | Queue depth > 10000 for 5 minutes | Warning | 15 minutes |
 
+### Monitoring Configuration Validation
+
+Run local-only validation before applying monitoring changes:
+
+```bash
+python3 tools/monitoring_setup.py --validate-only --json-output
+```
+
+Validation checks the required dashboard names or UIDs, recommended alert
+rules, numeric thresholds, severities, and configured Slack or PagerDuty
+targets. It reports every error it finds in one run and does not call
+Prometheus, Grafana, Alertmanager, Slack, or PagerDuty APIs.
+
+For isolated fixture checks, pass a dashboard directory explicitly:
+
+```bash
+python3 tools/monitoring_setup.py --validate-only --dashboard-dir ./monitoring/dashboards
+```
+
 ## Incident Response
 
 ### Severity Levels

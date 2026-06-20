@@ -18,6 +18,7 @@ Usage:
     python3 monitoring_setup.py --init --env production
     python3 monitoring_setup.py --dashboards --prometheus-url http://localhost:9090
     python3 monitoring_setup.py --alerts --file alerts.yaml --dry-run
+    python3 monitoring_setup.py --validate-only --json-output
     python3 monitoring_setup.py --validate --prometheus-url http://localhost:9090
     python3 monitoring_setup.py --backup --output-dir ./monitoring_backup
 """
@@ -25,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -42,6 +44,29 @@ DEFAULT_GRAFANA_URL = "http://localhost:3000"
 
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "dashboards")
 ALERT_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "alerts")
+
+REQUIRED_DASHBOARDS: List[Dict[str, str]] = [
+    {"title": "System Overview", "uid": "tot-system-overview"},
+    {"title": "API Performance", "uid": "tot-api-performance"},
+    {"title": "Market Data", "uid": "tot-market-data"},
+    {"title": "Business Metrics", "uid": "tot-business-metrics"},
+    {"title": "Service Health", "uid": "tot-service-health"},
+]
+
+REQUIRED_ALERT_NAMES = {
+    "ServiceDown",
+    "HighLatency",
+    "HighErrorRate",
+    "LowDiskSpace",
+    "HighCPUUsage",
+    "HighMemoryUsage",
+    "CertificateExpiring",
+    "HighDBConnections",
+    "QueueBacklog",
+}
+
+VALID_SEVERITIES = {"critical", "warning", "info"}
+THRESHOLD_RE = re.compile(r"(?:==|!=|>=|<=|>|<)\s*-?\d+(?:\.\d+)?")
 
 RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     {
@@ -150,6 +175,150 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
     {"name": "instance:cpu_usage:ratio", "expr": "rate(process_cpu_seconds_total[5m])"},
     {"name": "service:uptime:days", "expr": "time() - process_start_time_seconds{job=~'.+'}"},
 ]
+
+
+def add_validation_error(report: Dict[str, Any], message: str) -> None:
+    report["errors"].append(message)
+
+
+def add_validation_warning(report: Dict[str, Any], message: str) -> None:
+    report["warnings"].append(message)
+
+
+def load_dashboard_files(dashboard_dir: str, report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    dashboards: List[Dict[str, Any]] = []
+    if not os.path.isdir(dashboard_dir):
+        add_validation_error(report, f"Dashboard directory not found: {dashboard_dir}")
+        return dashboards
+
+    for root, _, files in os.walk(dashboard_dir):
+        for filename in sorted(files):
+            if not filename.endswith(".json"):
+                continue
+            path = os.path.join(root, filename)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    dashboards.append(json.load(f))
+            except (OSError, json.JSONDecodeError) as exc:
+                add_validation_error(report, f"Invalid dashboard JSON {path}: {exc}")
+
+    if not dashboards:
+        add_validation_error(report, f"No dashboard JSON files found in {dashboard_dir}")
+    return dashboards
+
+
+def validate_required_dashboards(dashboard_dir: str, report: Dict[str, Any]) -> None:
+    dashboards = load_dashboard_files(dashboard_dir, report)
+    found_titles = {str(dashboard.get("title", "")).strip() for dashboard in dashboards}
+    found_uids = {str(dashboard.get("uid", "")).strip() for dashboard in dashboards}
+
+    for required in REQUIRED_DASHBOARDS:
+        title = required["title"]
+        uid = required["uid"]
+        if title not in found_titles and uid not in found_uids:
+            add_validation_error(report, f"Missing required dashboard: {title} ({uid})")
+
+    report["summary"]["dashboards_checked"] = len(dashboards)
+
+
+def validate_alert_rules(rules: List[Dict[str, Any]], report: Dict[str, Any]) -> None:
+    seen_names = set()
+    present_names = set()
+
+    for index, rule in enumerate(rules, start=1):
+        name = str(rule.get("name", "")).strip()
+        expr = str(rule.get("expr", "")).strip()
+        severity = str(rule.get("severity", "")).strip()
+        duration = str(rule.get("duration", "")).strip()
+
+        if not name:
+            add_validation_error(report, f"Alert rule #{index} is missing name")
+        elif name in seen_names:
+            add_validation_error(report, f"Duplicate alert rule name: {name}")
+        else:
+            seen_names.add(name)
+            present_names.add(name)
+
+        if not expr:
+            add_validation_error(report, f"Alert rule {name or index} is missing expr")
+        elif not THRESHOLD_RE.search(expr):
+            add_validation_error(report, f"Alert rule {name or index} has no numeric threshold in expr")
+
+        if not duration:
+            add_validation_error(report, f"Alert rule {name or index} is missing duration")
+
+        if severity not in VALID_SEVERITIES:
+            add_validation_error(report, f"Alert rule {name or index} has invalid severity: {severity or '<empty>'}")
+
+        if not str(rule.get("summary", "")).strip():
+            add_validation_warning(report, f"Alert rule {name or index} is missing summary")
+
+        if not str(rule.get("description", "")).strip():
+            add_validation_warning(report, f"Alert rule {name or index} is missing description")
+
+    missing_alerts = sorted(REQUIRED_ALERT_NAMES - present_names)
+    for name in missing_alerts:
+        add_validation_error(report, f"Missing required alert rule: {name}")
+
+    report["summary"]["alert_rules_checked"] = len(rules)
+
+
+def validate_notification_targets(slack_webhook: str, pagerduty_key: str,
+                                  report: Dict[str, Any]) -> None:
+    if slack_webhook:
+        if not slack_webhook.startswith("https://"):
+            add_validation_error(report, "Slack webhook must use https://")
+    else:
+        add_validation_warning(report, "Slack webhook is not configured")
+
+    if pagerduty_key:
+        if len(pagerduty_key.strip()) < 10:
+            add_validation_error(report, "PagerDuty routing key is too short")
+    else:
+        add_validation_warning(report, "PagerDuty routing key is not configured")
+
+    report["summary"]["notification_targets_checked"] = int(bool(slack_webhook)) + int(bool(pagerduty_key))
+
+
+def validate_monitoring_config(args: argparse.Namespace) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "summary": {
+            "dashboards_checked": 0,
+            "alert_rules_checked": 0,
+            "notification_targets_checked": 0,
+        },
+    }
+
+    validate_required_dashboards(args.dashboard_dir, report)
+    validate_alert_rules(RECOMMENDED_ALERT_RULES, report)
+    validate_notification_targets(args.slack_webhook, args.pagerduty_key, report)
+    report["ok"] = not report["errors"]
+    return report
+
+
+def print_validation_report(report: Dict[str, Any], json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    print("Monitoring validation summary:")
+    for key, value in report["summary"].items():
+        print(f"  {key}: {value}")
+
+    if report["warnings"]:
+        print("Warnings:")
+        for warning in report["warnings"]:
+            print(f"  - {warning}")
+
+    if report["errors"]:
+        print("Errors:")
+        for error in report["errors"]:
+            print(f"  - {error}")
+    else:
+        print("No validation errors found")
 
 
 def http_request(method: str, url: str, data: Any = None,
@@ -388,6 +557,11 @@ def parse_args():
     parser.add_argument("--backup", action="store_true", help="Backup monitoring config")
     parser.add_argument("--output-dir", default="./monitoring_backup", help="Backup output directory")
     parser.add_argument("--validate", action="store_true", help="Validate monitoring configuration")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Validate local dashboards, alerts, and notification targets without network writes")
+    parser.add_argument("--json-output", action="store_true", help="Print validation output as JSON")
+    parser.add_argument("--dashboard-dir", default=DASHBOARD_DIR, help="Dashboard JSON directory for validation")
+    parser.add_argument("--alert-rules-dir", default=ALERT_RULES_DIR, help="Alert rules directory for validation")
     parser.add_argument("--env", default="development", help="Target environment")
     return parser.parse_args()
 
@@ -427,6 +601,11 @@ def main():
             args.output_dir, args.prometheus_url,
             args.grafana_url, args.grafana_api_key) else 1
 
+    if args.validate_only:
+        report = validate_monitoring_config(args)
+        print_validation_report(report, args.json_output)
+        return 0 if report["ok"] else 1
+
     if args.validate:
         print("Validating monitoring configuration...")
         configs_to_check = [
@@ -448,4 +627,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
