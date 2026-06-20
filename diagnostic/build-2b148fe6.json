@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-06-20T15:25:18.227150+00:00",
+  "commit": "2b148fe6",
+  "diagnostic_logd": "diagnostic/build-2b148fe6.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "86063c45215aa5c853df",
+  "decrypt_command": "encryptly unpack diagnostic/build-2b148fe6.logd <outdir> --password 86063c45215aa5c853df",
+  "total_modules": 10,
+  "passed": 7,
+  "failed": 3,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'cargo'"
+    },
+    {
+      "name": "frontend",
+      "status": "PASS",
+      "elapsed_seconds": 5.663,
+      "artifact": "/Volumes/Soengkit\u786c\u76d8/Codex\u65b0\u9879\u76ee\u4e0e\u8f93\u51fa/2026-06-19_Agent Bounty Workbench/02_candidate_bounties/lobster-kickama-compliance-paths-372/repo/frontend/dist",
+      "output": "> tent-frontend@0.0.0 build\n> tsc -b && vite build\n\nvite v6.4.3 building for production...\ntransforming...\n\u2713 100 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.62 kB \u2502 gzip:  0.34 kB\ndist/assets/state-BkjSKDbY.js     8.91 kB \u2502 gzip:  3.54 kB \u2502 map:    57.15 kB\ndist/assets/vendor-CREcWLHI.js   48.93 kB \u2502 gzip: 17.25 kB \u2502 map:   481.27 kB\ndist/assets/index-CyxcoTyU.js   231.32 kB \u2502 gzip: 72.16 kB \u2502 map: 1,044.42 kB\n\u2713 built in 766ms"
+    },
+    {
+      "name": "market",
+      "status": "PASS",
+      "elapsed_seconds": 3.338,
+      "artifact": "/Volumes/Soengkit\u786c\u76d8/Codex\u65b0\u9879\u76ee\u4e0e\u8f93\u51fa/2026-06-19_Agent Bounty Workbench/02_candidate_bounties/lobster-kickama-compliance-paths-372/repo/market/market",
+      "output": ""
+    },
+    {
+      "name": "frailbox",
+      "status": "FAIL",
+      "elapsed_seconds": 0.342,
+      "artifact": null,
+      "output": "gcc -Wall -Wextra -Wpedantic -std=c2x -O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE -Iinclude -MMD -MP -c src/arena.c -o build/src/arena.o\nsrc/arena.c:17:23: error: use of undeclared identifier 'MAP_HUGETLB'\n   17 |         mmap_flags |= MAP_HUGETLB;\n      |                       ^~~~~~~~~~~\nsrc/arena.c:179:17: warning: comparison of distinct pointer types ('const void *' and 'char *') [-Wcompare-distinct-pointer-types]\n  179 |             ptr < (char *)region->start + region->size) {\n      |             ~~~ ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n1 warning and 1 error generated.\nmake: *** [build/src/arena.o] Error 1"
+    },
+    {
+      "name": "engine",
+      "status": "PASS",
+      "elapsed_seconds": 0.954,
+      "artifact": "/Volumes/Soengkit\u786c\u76d8/Codex\u65b0\u9879\u76ee\u4e0e\u8f93\u51fa/2026-06-19_Agent Bounty Workbench/02_candidate_bounties/lobster-kickama-compliance-paths-372/repo/frailbox/engine/build/trial-engine",
+      "output": "[100%] Built target trial-engine"
+    },
+    {
+      "name": "compliance",
+      "status": "PASS",
+      "elapsed_seconds": 5.653,
+      "artifact": "/Volumes/Soengkit\u786c\u76d8/Codex\u65b0\u9879\u76ee\u4e0e\u8f93\u51fa/2026-06-19_Agent Bounty Workbench/02_candidate_bounties/lobster-kickama-compliance-paths-372/repo/compliance/build",
+      "output": "[WARN] Failed to load compliance overrides from S3: https://s3-eu-west-1.amazonaws.com/internal.config/tot/compliance-overrides.json\n[WARN] Continuing with default configuration. Good fucking luck.\n6\u6708 20, 2026 11:25:16 \u4e0b\u5348 com.tentoftrials.compliance.ComplianceAuditor <init>\n\u4fe1\u606f: ComplianceAuditor initialized. Good fucking luck."
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "PASS",
+      "elapsed_seconds": 0.079,
+      "artifact": null,
+      "output": "Syntax OK"
+    },
+    {
+      "name": "nfc-scanner",
+      "status": "PASS",
+      "elapsed_seconds": 0.055,
+      "artifact": null,
+      "output": ""
+    },
+    {
+      "name": "openapi-haskell",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'ghc'"
+    },
+    {
+      "name": "openapi-tools",
+      "status": "PASS",
+      "elapsed_seconds": 0.02,
+      "artifact": null,
+      "output": ""
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-2b148fe6.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
