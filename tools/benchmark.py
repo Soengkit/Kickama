@@ -50,7 +50,8 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # DATA MODELS
@@ -79,6 +80,26 @@ class LatencySample:
     status_code: int
     success: bool
     error: Optional[str] = None
+
+
+LOWER_IS_BETTER_METRICS = {
+    "failed_requests",
+    "timeout_requests",
+    "latency_ms.min",
+    "latency_ms.p50",
+    "latency_ms.p90",
+    "latency_ms.p95",
+    "latency_ms.p99",
+    "latency_ms.max",
+    "latency_ms.avg",
+    "latency_ms.stddev",
+}
+
+HIGHER_IS_BETTER_METRICS = {
+    "total_requests",
+    "successful_requests",
+    "requests_per_second",
+}
 
 # ---------------------------------------------------------------------------
 # HTTP CLIENT
@@ -230,6 +251,102 @@ def aggregate_results(results: List[LatencySample], benchmark_type: str,
         target_endpoint=url,
         concurrency=concurrency,
     )
+
+
+def result_to_dict(result: BenchmarkResult) -> Dict[str, Any]:
+    return {
+        "benchmark_type": result.benchmark_type,
+        "start_time": result.start_time,
+        "end_time": result.end_time,
+        "duration_seconds": result.duration_seconds,
+        "total_requests": result.total_requests,
+        "successful_requests": result.successful_requests,
+        "failed_requests": result.failed_requests,
+        "timeout_requests": result.timeout_requests,
+        "requests_per_second": result.requests_per_second,
+        "latency_ms": result.latency_ms,
+        "error_distribution": result.error_distribution,
+        "target_endpoint": result.target_endpoint,
+        "concurrency": result.concurrency,
+    }
+
+
+def load_baseline(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if "result" in payload and isinstance(payload["result"], dict):
+        return payload["result"]
+    return payload
+
+
+def write_baseline(path: str, result: BenchmarkResult) -> None:
+    baseline_path = Path(path)
+    if baseline_path.parent != Path("."):
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(baseline_path, "w", encoding="utf-8") as f:
+        json.dump(result_to_dict(result), f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def _metric_value(payload: Dict[str, Any], metric: str) -> Optional[float]:
+    current: Any = payload
+    for part in metric.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    if isinstance(current, (int, float)) and not isinstance(current, bool):
+        return float(current)
+    return None
+
+
+def _percentage_change(baseline: float, current: float) -> Optional[float]:
+    if baseline == 0:
+        return None
+    return ((current - baseline) / abs(baseline)) * 100
+
+
+def compare_with_baseline(current: BenchmarkResult, baseline: Dict[str, Any]) -> Dict[str, Any]:
+    current_payload = result_to_dict(current)
+    metrics = sorted(LOWER_IS_BETTER_METRICS | HIGHER_IS_BETTER_METRICS)
+    comparisons: List[Dict[str, Any]] = []
+
+    for metric in metrics:
+        baseline_value = _metric_value(baseline, metric)
+        current_value = _metric_value(current_payload, metric)
+        if baseline_value is None or current_value is None:
+            continue
+
+        absolute_change = current_value - baseline_value
+        percent_change = _percentage_change(baseline_value, current_value)
+        lower_is_better = metric in LOWER_IS_BETTER_METRICS
+        regression = absolute_change > 0 if lower_is_better else absolute_change < 0
+        regression_percent = None
+        if percent_change is not None and regression:
+            regression_percent = abs(percent_change)
+
+        comparisons.append({
+            "metric": metric,
+            "baseline": baseline_value,
+            "current": current_value,
+            "absolute_change": absolute_change,
+            "percent_change": percent_change,
+            "lower_is_better": lower_is_better,
+            "regression": regression,
+            "regression_percent": regression_percent,
+        })
+
+    max_regression = max(
+        (entry["regression_percent"] for entry in comparisons
+         if entry["regression_percent"] is not None),
+        default=0,
+    )
+
+    return {
+        "benchmark_type": current.benchmark_type,
+        "target_endpoint": current.target_endpoint,
+        "comparisons": comparisons,
+        "max_regression_percent": max_regression,
+    }
 
 # ---------------------------------------------------------------------------
 # BENCHMARK FUNCTIONS
@@ -410,6 +527,24 @@ def print_results(result: BenchmarkResult):
     print(f"{'='*60}\n")
 
 
+def print_comparison(comparison: Dict[str, Any], fail_regression: Optional[float] = None):
+    print("  Baseline comparison:")
+    for entry in comparison["comparisons"]:
+        percent = entry["percent_change"]
+        percent_label = "n/a" if percent is None else f"{percent:+.2f}%"
+        direction = "regression" if entry["regression"] else "ok"
+        print(
+            f"    {entry['metric']}: "
+            f"{entry['baseline']:.4f} -> {entry['current']:.4f} "
+            f"({entry['absolute_change']:+.4f}, {percent_label}) [{direction}]"
+        )
+
+    max_regression = comparison["max_regression_percent"]
+    print(f"  Max regression: {max_regression:.2f}%")
+    if fail_regression is not None:
+        print(f"  Regression threshold: {fail_regression:.2f}%")
+
+
 def main():
     parser = argparse.ArgumentParser(description="API Benchmark Tool")
     parser.add_argument("--endpoint", "-e", default="http://localhost:8080/health",
@@ -419,6 +554,12 @@ def main():
     parser.add_argument("--timeout", "-t", type=float, default=30.0,
                        help="Request timeout in seconds")
     parser.add_argument("--output", "-o", help="Save results to JSON file")
+    parser.add_argument("--baseline",
+                       help="Load a previous JSON benchmark result and compare current results")
+    parser.add_argument("--write-baseline",
+                       help="Save the current benchmark result as a deterministic baseline JSON file")
+    parser.add_argument("--fail-regression", type=float,
+                       help="Exit non-zero when any comparable metric regresses by more than this percent")
 
     subparsers = parser.add_subparsers(dest="mode", help="Benchmark mode")
 
@@ -471,25 +612,24 @@ def main():
         result = run_spike_benchmark(args.endpoint, args.concurrency, args.duration, args.spike_start, args.spike_duration, args.normal_rps, args.spike_rps, args.timeout)
 
     if result:
+        comparison = compare_with_baseline(result, load_baseline(args.baseline)) if args.baseline else None
         print_results(result)
+        if comparison:
+            print_comparison(comparison, args.fail_regression)
+        if args.write_baseline:
+            write_baseline(args.write_baseline, result)
+            print(f"Baseline saved to {args.write_baseline}")
         if args.output:
+            output_payload = result_to_dict(result)
+            if comparison:
+                output_payload["comparison"] = comparison
             with open(args.output, "w") as f:
-                json.dump({
-                    "benchmark_type": result.benchmark_type,
-                    "start_time": result.start_time,
-                    "end_time": result.end_time,
-                    "duration_seconds": result.duration_seconds,
-                    "total_requests": result.total_requests,
-                    "successful_requests": result.successful_requests,
-                    "failed_requests": result.failed_requests,
-                    "timeout_requests": result.timeout_requests,
-                    "requests_per_second": result.requests_per_second,
-                    "latency_ms": result.latency_ms,
-                    "error_distribution": result.error_distribution,
-                    "target_endpoint": result.target_endpoint,
-                    "concurrency": result.concurrency,
-                }, f, indent=2)
+                json.dump(output_payload, f, indent=2, sort_keys=True)
+                f.write("\n")
             print(f"Results saved to {args.output}")
+        if comparison and args.fail_regression is not None:
+            if comparison["max_regression_percent"] > args.fail_regression:
+                return 2
 
     return 0
 

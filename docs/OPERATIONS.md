@@ -26,6 +26,31 @@ Each service exposes a health check endpoint:
 | Frailbox Runtime | `/health` | 8082 |
 | Frontend | `/` | 3000 |
 
+### Benchmark Baseline Review
+
+Use `tools/benchmark.py` with a saved baseline before reviewing performance
+changes. Save a deterministic baseline from a known-good run:
+
+```bash
+python3 tools/benchmark.py --endpoint http://localhost:8080/health \
+  --write-baseline .benchmarks/latency-baseline.json latency --requests 100
+```
+
+Compare a later run against that baseline and fail the command when any
+comparable metric regresses beyond the allowed percentage:
+
+```bash
+python3 tools/benchmark.py --endpoint http://localhost:8080/health \
+  --baseline .benchmarks/latency-baseline.json \
+  --fail-regression 10 \
+  --output .benchmarks/latency-comparison.json \
+  latency --requests 100
+```
+
+The text output reports absolute and percentage deltas for each comparable
+metric. The JSON output keeps the benchmark result plus a `comparison` section
+that can be attached to PRs or archived with release evidence.
+
 The health check returns a 200 OK response with a JSON body:
 
 ```json
