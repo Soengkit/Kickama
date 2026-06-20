@@ -161,6 +161,21 @@ Estimated recovery time:
 - Full restore from daily backup: 2-4 hours
 - Full restore from weekly backup: 4-8 hours
 
+### Rollback Dry-Run Summary
+
+Before executing a legacy rollback, operators can produce a structured dry-run
+summary without running deployment commands:
+
+```bash
+python3 tools/deploy.py --env production --service backend --rollback --version v3.1.0 --dry-run --rollback-summary text
+python3 tools/deploy.py --env production --service backend --rollback --version v3.1.0 --dry-run --rollback-summary json
+```
+
+The summary includes the service, environment, rollback version, planned
+actions, risk notes, and rollback steps. Secret-looking values are redacted in
+summary output. The command is read-only and must be followed by the normal
+approval path before a production rollback is executed without `--dry-run`.
+
 ## Database Administration
 
 ### Connection Pool Configuration

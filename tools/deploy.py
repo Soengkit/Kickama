@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,10 @@ ENVIRONMENTS = {
 }
 
 ROLLBACK_VERSIONS: Dict[str, List[str]] = {}
+SECRET_KEY_PATTERN = re.compile(r"(token|secret|password|credential|key)", re.IGNORECASE)
+SECRET_VALUE_PATTERN = re.compile(
+    r"(?i)\b(bearer|basic|token|password|secret|api[_-]?key)=([^\s,;]+)"
+)
 
 
 def load_deployment_history(env: str) -> List[Dict]:
@@ -123,6 +128,81 @@ def load_deployment_history(env: str) -> List[Dict]:
 def save_deployment_history(env: str, history: List[Dict]):
     with open(f".deploy_history_{env}.json", "w") as f:
         json.dump(history, f, indent=2)
+
+
+def redact_value(key: str, value):
+    if value is None:
+        return value
+    if SECRET_KEY_PATTERN.search(key):
+        return "[REDACTED]"
+    if isinstance(value, str):
+        return SECRET_VALUE_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    if isinstance(value, dict):
+        return {k: redact_value(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(key, item) for item in value]
+    return value
+
+
+def build_rollback_summary(service: str, env: str, version: str) -> Dict:
+    env_config = ENVIRONMENTS.get(env, {})
+    service_config = SERVICES.get(service, {})
+    namespace = env_config.get("namespace", "unknown")
+    deployment_name = service_config.get("name", service)
+    image = f"registry.example.com/tent/{service}:{version}"
+
+    summary = {
+        "mode": "rollback-dry-run",
+        "service": service,
+        "environment": env,
+        "version": version,
+        "target": {
+            "host": env_config.get("host"),
+            "namespace": namespace,
+            "kube_context": env_config.get("kube_context"),
+            "deployment": deployment_name,
+            "image": image,
+        },
+        "planned_actions": [
+            f"Skip build and tests for rollback to {version}",
+            f"Build and push rollback image reference {image} if required by the legacy pipeline",
+            f"Apply Kubernetes manifest for {service} in namespace {namespace}",
+            f"Set deployment/{deployment_name} image to {image}",
+            "Wait for rollout completion",
+            f"Run {service} health check after rollback",
+        ],
+        "risk_notes": [
+            "Dry-run summary only; no commands are executed.",
+            "Confirm the rollback version exists in the target registry before running without --dry-run.",
+            "Production rollbacks require the normal approval path before execution.",
+        ],
+        "rollback_steps": [
+            f"python3 tools/deploy.py --env {env} --service {service} --rollback --version {version}",
+            "Monitor rollout status and health endpoint.",
+            "If health checks fail, stop traffic and restore the previously healthy version.",
+        ],
+    }
+    return redact_value("", summary)
+
+
+def print_rollback_summary(summary: Dict, output_format: str):
+    if output_format == "json":
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+
+    print("\nRollback dry-run summary")
+    print(f"  Service:     {summary['service']}")
+    print(f"  Environment: {summary['environment']}")
+    print(f"  Version:     {summary['version']}")
+    print("  Planned actions:")
+    for action in summary["planned_actions"]:
+        print(f"    - {action}")
+    print("  Risk notes:")
+    for note in summary["risk_notes"]:
+        print(f"    - {note}")
+    print("  Rollback steps:")
+    for step in summary["rollback_steps"]:
+        print(f"    - {step}")
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +461,8 @@ def parse_args():
     parser.add_argument("--skip-health", action="store_true", help="Skip health check")
     parser.add_argument("--rollback", action="store_true", help="Rollback instead of deploy")
     parser.add_argument("--version", help="Version to rollback to")
+    parser.add_argument("--rollback-summary", choices=["text", "json"],
+                       help="Print a dry-run rollback summary in text or JSON format")
     parser.add_argument("--list", action="store_true", help="List deployments")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -404,7 +486,11 @@ def main():
             return 1
 
         if args.dry_run:
-            print(f"Would rollback {args.service} in {args.env} to {args.version}")
+            if args.rollback_summary:
+                summary = build_rollback_summary(args.service, args.env, args.version)
+                print_rollback_summary(summary, args.rollback_summary)
+            else:
+                print(f"Would rollback {args.service} in {args.env} to {args.version}")
             return 0
 
         success = rollback_service(args.service, args.env, args.version)
