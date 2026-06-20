@@ -33,6 +33,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -63,6 +64,94 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\b[A-Za-z0-9._%+-]+:[A-Za-z0-9._%+-]+@"),
+    re.compile(r"\b(?:sk|pk|ghp|gho|github_pat)_[A-Za-z0-9_]{12,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+]
+REDACTION_MARKER = "[REDACTED]"
+
+
+def redact_text(value: str) -> str:
+    redacted = value
+    for pattern in SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(REDACTION_MARKER, redacted)
+    return redacted
+
+
+def parse_prometheus_labels(raw_labels: str) -> Dict[str, str]:
+    labels = {}
+    for match in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)="((?:\\.|[^"\\])*)"', raw_labels):
+        key = redact_text(match.group(1))
+        value = bytes(match.group(2), "utf-8").decode("unicode_escape")
+        labels[key] = redact_text(value)
+    return labels
+
+
+def parse_prometheus_metrics(path: str) -> List[Dict[str, Any]]:
+    metrics = []
+    if not path:
+        return metrics
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            sample = parts[0]
+            labels = {}
+            if "{" in sample and sample.endswith("}"):
+                name, raw_labels = sample.split("{", 1)
+                labels = parse_prometheus_labels(raw_labels[:-1])
+            else:
+                name = sample
+            try:
+                value = float(parts[1])
+            except ValueError:
+                continue
+            timestamp = None
+            if len(parts) >= 3:
+                try:
+                    raw_ts = float(parts[2])
+                    timestamp = raw_ts / 1000 if raw_ts > 9999999999 else raw_ts
+                except ValueError:
+                    timestamp = None
+            metrics.append({
+                "metric_name": redact_text(name),
+                "labels": labels,
+                "value": value,
+                "timestamp": timestamp,
+            })
+    return metrics
+
+
+def build_stale_metric_report(
+    metrics: List[Dict[str, Any]],
+    service: Optional[str],
+    environment: str,
+    stale_after_seconds: int,
+    now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    current_time = now if now is not None else time.time()
+    report = []
+    for metric in metrics:
+        timestamp = metric.get("timestamp")
+        age_seconds = None if timestamp is None else max(0, round(current_time - timestamp, 3))
+        stale = timestamp is None or age_seconds > stale_after_seconds
+        report.append({
+            "service": redact_text(service or "all"),
+            "environment": redact_text(environment),
+            "metric_name": metric["metric_name"],
+            "labels": metric.get("labels", {}),
+            "timestamp": timestamp,
+            "age_seconds": age_seconds,
+            "stale": stale,
+        })
+    return report
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
@@ -200,10 +289,17 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(
+    service: Optional[str] = None,
+    json_output: bool = False,
+    environment: str = "local",
+    prometheus_metrics: Optional[str] = None,
+    stale_after_seconds: int = 300,
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
+        "environment": redact_text(environment),
         "services": {},
         "infrastructure": {},
         "system": {},
@@ -271,6 +367,17 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
 
     results["overall_status"] = "OK" if all_ok else "DEGRADED"
 
+    if prometheus_metrics:
+        stale_report = build_stale_metric_report(
+            parse_prometheus_metrics(prometheus_metrics),
+            service,
+            environment,
+            stale_after_seconds,
+        )
+        results["prometheus_stale_metrics"] = stale_report
+        if any(item["stale"] for item in stale_report):
+            results["overall_status"] = "DEGRADED"
+
     return results
 
 
@@ -307,6 +414,10 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--env", default="local", help="Environment label for diagnostic output")
+    parser.add_argument("--prometheus-metrics", help="Prometheus text exposition file to inspect")
+    parser.add_argument("--stale-after-seconds", type=int, default=300,
+                       help="Mark Prometheus metrics stale after this age")
     return parser.parse_args()
 
 
@@ -317,7 +428,13 @@ def main():
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(
+                    args.service,
+                    args.json,
+                    args.env,
+                    args.prometheus_metrics,
+                    args.stale_after_seconds,
+                )
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +443,13 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(
+            args.service,
+            args.json,
+            args.env,
+            args.prometheus_metrics,
+            args.stale_after_seconds,
+        )
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
