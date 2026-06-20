@@ -68,6 +68,44 @@ MEMORY_THRESHOLD_CRITICAL = 90
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
+def _header_value(headers: List[Tuple[str, str]], name: str) -> str:
+    for key, value in headers:
+        if key.lower() == name.lower():
+            return value
+    return ""
+
+
+def _validate_http_success(status: int, headers: List[Tuple[str, str]], body: str, path: str) -> Tuple[str, str]:
+    if status != 200:
+        if status < 500:
+            return "WARNING", f"HTTP {status}: {body[:100]}"
+        return "CRITICAL", f"HTTP {status}: {body[:100]}"
+
+    if not body.strip():
+        return "CRITICAL", "HTTP 200: empty response body"
+
+    if path.rstrip("/") == "/health":
+        content_type = _header_value(headers, "Content-Type").lower()
+        if "application/json" not in content_type:
+            return "CRITICAL", f"HTTP 200: unexpected content type {content_type or 'missing'}"
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            return "CRITICAL", f"HTTP 200: invalid JSON health body: {exc.msg}"
+
+        if not isinstance(payload, dict):
+            return "CRITICAL", "HTTP 200: JSON health body is not an object"
+
+        health_status = str(payload.get("status", "")).lower()
+        if health_status not in {"ok", "healthy"}:
+            return "CRITICAL", f"HTTP 200: unexpected health status {health_status or 'missing'}"
+
+        return "OK", f"HTTP {status}: health status {health_status}"
+
+    return "OK", f"HTTP {status}"
+
+
 def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
     import http.client
     try:
@@ -75,20 +113,14 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         conn.request("GET", path)
         resp = conn.getresponse()
         status = resp.status
+        headers = resp.getheaders()
         body = resp.read().decode("utf-8", errors="replace")[:200]
         conn.close()
 
-        if status == 200:
-            result = "OK"
-            detail = f"HTTP {status}"
-        elif status < 500:
-            result = "WARNING"
-            detail = f"HTTP {status}: {body[:100]}"
-        else:
-            result = "CRITICAL"
-            detail = f"HTTP {status}: {body[:100]}"
-
+        result, detail = _validate_http_success(status, headers, body, path)
         return result, detail, status
+    except (socket.timeout, TimeoutError):
+        return "CRITICAL", f"Connection timeout ({timeout}s)", 0
     except Exception as e:
         return "CRITICAL", str(e), 0
 
@@ -348,4 +380,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

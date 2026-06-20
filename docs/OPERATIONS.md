@@ -37,6 +37,13 @@ The health check returns a 200 OK response with a JSON body:
 }
 ```
 
+Automated HTTP health checks treat a socket connection and `200 OK` as
+necessary but not sufficient. `/health` responses must be non-empty JSON with
+an `application/json` content type and a healthy `status` value such as `ok` or
+`healthy`. Empty bodies, malformed JSON, unexpected content types, timeout
+errors, and unhealthy or missing `status` fields are reported as failures so a
+silent service cannot be mistaken for a healthy one.
+
 ### Prometheus Metrics
 
 Each service exposes Prometheus metrics at `/metrics` on the same port as the
