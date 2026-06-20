@@ -310,3 +310,36 @@ Audit logs are retained for 365 days and include:
 2. Update Kubernetes secret: `kubectl create secret tls tot-tls --cert=new.crt --key=new.key -n tent-production --dry-run=client -o yaml | kubectl apply -f -`
 3. Restart services: `kubectl rollout restart deployment -n tent-production`
 4. Verify new certificate: `openssl s_client -connect api.example.com:443 -servername api.example.com`
+
+### Deployment Rollback Dry-Run Summary
+
+Legacy deployment dry-runs can export an audit-friendly rollback summary without
+scraping terminal output:
+
+```bash
+python3 tools/deploy.py \
+  --env staging \
+  --service backend \
+  --rollback \
+  --version v3.1.0 \
+  --dry-run \
+  --rollback-summary-output /tmp/rollback-summary.json \
+  --rollback-summary-format json
+```
+
+For a human-readable report, use:
+
+```bash
+python3 tools/deploy.py \
+  --env staging \
+  --service backend \
+  --rollback \
+  --version v3.1.0 \
+  --dry-run \
+  --rollback-summary-output /tmp/rollback-summary.txt \
+  --rollback-summary-format text
+```
+
+The summary includes service, environment, namespace, version/tag, planned
+actions, risk notes, and rollback steps. Secret-looking values in tags and image
+references are redacted before being written to disk.
