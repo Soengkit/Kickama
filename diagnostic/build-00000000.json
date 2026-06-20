@@ -1,23 +1,24 @@
 {
-  "generated_at": "2026-06-16T15:23:47.496569+00:00",
+  "generated_at": "2026-06-20T17:35:52.560716+00:00",
   "commit": "00000000",
-  "diagnostic_logd": "diagnostic/build-00000000.logd",
+  "diagnostic_logd": null,
   "diagnostic_logd_error": null,
+  "message_blocker": null,
   "chunked": false,
   "chunk_size_bytes": null,
-  "password": "4c7df15ab09fbb066197",
-  "decrypt_command": "encryptly unpack diagnostic/build-00000000.logd <outdir> --password 4c7df15ab09fbb066197",
+  "password": null,
+  "decrypt_command": null,
   "total_modules": 1,
   "passed": 0,
   "failed": 1,
   "modules": [
     {
-      "name": "frailbox",
+      "name": "encryptly-preflight",
       "status": "FAIL",
-      "elapsed_seconds": 0,
+      "elapsed_seconds": 80.625,
       "artifact": null,
-      "output": "Command not found: [Errno 2] No such file or directory: 'make'"
+      "output": "encryptly could not create an archive. You may have timed out; try launching it in the background and waiting for it to finish with no timeout due to a bug in encryptly. 2abc495b35f893a0c2e4"
     }
   ],
-  "pr_note": "Include this JSON diagnostic report and diagnostic/build-00000000.logd in your PR. Maintainers may ask you to remove these diagnostic artifacts before merging."
+  "pr_note": "Encrypted diagnostic logd artifact was not created; include this JSON report showing why. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
 }

@@ -46,11 +46,59 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Counter, Dict, List, Optional, Tuple
+from typing import Any, Counter, Dict, Iterable, List, Optional, Tuple
 from collections import defaultdict, Counter
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
+
+SECRET_FIELD_RE = re.compile(
+    r"(api[_-]?key|authorization|bearer|cookie|credential|password|secret|token)",
+    re.IGNORECASE,
+)
+SECRET_VALUE_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|password|secret|token)\b\s*[:=]?\s*(?:bearer\s+)?\S+"
+)
+
+
+def redact_secret_value(value: Any) -> Tuple[Any, int]:
+    """Redact secret-looking values while returning the number of redactions."""
+
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        count = 0
+        for key, item in value.items():
+            if SECRET_FIELD_RE.search(str(key)):
+                redacted[str(key)] = "[REDACTED]"
+                count += 1
+            else:
+                cleaned, child_count = redact_secret_value(item)
+                redacted[str(key)] = cleaned
+                count += child_count
+        return redacted, count
+
+    if isinstance(value, list):
+        redacted_items = []
+        count = 0
+        for item in value:
+            cleaned, child_count = redact_secret_value(item)
+            redacted_items.append(cleaned)
+            count += child_count
+        return redacted_items, count
+
+    if isinstance(value, str):
+        matches = list(SECRET_VALUE_RE.finditer(value))
+        if not matches:
+            return value, 0
+        return (
+            SECRET_VALUE_RE.sub(
+                lambda match: f"{match.group(1)}=[REDACTED]",
+                value,
+            ),
+            len(matches),
+        )
+
+    return value, 0
 
 # ---------------------------------------------------------------------------
 # LOG PARSERS
@@ -206,6 +254,12 @@ class LogAggregator:
     def __init__(self):
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
         self.entries: List[Dict[str, Any]] = []
+        self.total_lines = 0
+        self.malformed_lines = 0
+        self.redacted_fields = 0
+        self.malformed_by_file: Counter = Counter()
+        self.redactions_by_file: Counter = Counter()
+        self.processed_by_file: Counter = Counter()
         self.level_counts: Counter = Counter()
         self.service_counts: Counter = Counter()
         self.hourly_counts: Counter = Counter()
@@ -219,12 +273,12 @@ class LogAggregator:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        if self._parse_line(line, filepath):
                             parsed_count += 1
             else:
                 with open(filepath, 'r', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        if self._parse_line(line, filepath):
                             parsed_count += 1
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
@@ -240,15 +294,31 @@ class LogAggregator:
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
 
-    def _parse_line(self, line: str) -> bool:
+    def _parse_line(self, line: str, source_file: Optional[str] = None) -> bool:
+        self.total_lines += 1
+        source_name = Path(source_file).name if source_file else "<stream>"
+        self.processed_by_file[source_name] += 1
+
         for parser in self.parsers:
             entry = parser.parse(line)
             if entry:
+                redacted_fields, redaction_count = redact_secret_value(entry.get('fields', {}))
+                redacted_message, message_redactions = redact_secret_value(entry.get('message', ''))
+                redaction_count += message_redactions
+                entry['fields'] = redacted_fields
+                entry['message'] = redacted_message
+                entry['source_file'] = source_name
+                if redaction_count:
+                    self.redacted_fields += redaction_count
+                    self.redactions_by_file[source_name] += redaction_count
                 self.entries.append(entry)
                 ts = entry.get('timestamp')
                 if ts:
-                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
-                    self.hourly_counts[hour] += 1
+                    try:
+                        hour = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
+                        self.hourly_counts[hour] += 1
+                    except (TypeError, ValueError):
+                        pass
                 level = entry.get('level', 'unknown').lower()
                 self.level_counts[level] += 1
                 service = entry.get('service', 'unknown')
@@ -260,6 +330,8 @@ class LogAggregator:
                     self.errors_by_service[service].append(msg)
                     self.error_patterns[msg] += 1
                 return True
+        self.malformed_lines += 1
+        self.malformed_by_file[source_name] += 1
         return False
 
     def get_summary(self) -> Dict[str, Any]:
@@ -279,8 +351,8 @@ class LogAggregator:
 
     def _get_time_range(self) -> Optional[Dict[str, str]]:
         timestamps = [
-            e['timestamp'] for e in self.entries
-            if e.get('timestamp')
+            float(e['timestamp']) for e in self.entries
+            if isinstance(e.get('timestamp'), (int, float))
         ]
         if not timestamps:
             return None
@@ -303,7 +375,7 @@ class LogAggregator:
             level = entry.get('level', '').lower()
             if level in ('error', 'critical'):
                 ts = entry.get('timestamp')
-                if ts:
+                if isinstance(ts, (int, float)):
                     hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
                     errors_by_hour[hour] += 1
         return [
@@ -359,6 +431,50 @@ class LogAggregator:
             }, f, indent=2, default=str)
         logger.info(f"Report exported to {output_path}")
 
+    def get_redaction_summary(self) -> Dict[str, Any]:
+        return {
+            'processed_lines': self.total_lines,
+            'parsed_entries': len(self.entries),
+            'malformed_lines': self.malformed_lines,
+            'redacted_fields': self.redacted_fields,
+            'source_files': sorted(self.processed_by_file),
+            'by_file': [
+                {
+                    'source_file': source,
+                    'processed_lines': self.processed_by_file[source],
+                    'malformed_lines': self.malformed_by_file.get(source, 0),
+                    'redacted_fields': self.redactions_by_file.get(source, 0),
+                }
+                for source in sorted(self.processed_by_file)
+            ],
+        }
+
+    def export_redaction_summary(self, output_path: str, output_format: str = "json"):
+        summary = self.get_redaction_summary()
+        if output_format == "json":
+            with open(output_path, 'w') as f:
+                json.dump(summary, f, indent=2)
+                f.write("\n")
+        else:
+            lines = [
+                "Log Redaction Summary",
+                "=====================",
+                f"processed_lines: {summary['processed_lines']}",
+                f"parsed_entries: {summary['parsed_entries']}",
+                f"malformed_lines: {summary['malformed_lines']}",
+                f"redacted_fields: {summary['redacted_fields']}",
+                "",
+                "by_file:",
+            ]
+            for item in summary['by_file']:
+                lines.append(
+                    f"  - {item['source_file']}: processed={item['processed_lines']} "
+                    f"malformed={item['malformed_lines']} redacted={item['redacted_fields']}"
+                )
+            with open(output_path, 'w') as f:
+                f.write("\n".join(lines) + "\n")
+        logger.info(f"Redaction summary exported to {output_path}")
+
     def generate_html_report(self, output_path: str):
         summary = self.get_summary()
         html = f"""<!DOCTYPE html>
@@ -410,6 +526,8 @@ def parse_args():
     parser.add_argument("--dir", help="Directory containing log files")
     parser.add_argument("--output", "-o", default="log_report.json", help="Output file path")
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
+    parser.add_argument("--redaction-summary", help="Optional path for redaction and malformed-record summary")
+    parser.add_argument("--redaction-summary-format", choices=["json", "text"], default="json", help="Redaction summary output format")
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
@@ -445,9 +563,10 @@ def main():
             print(f"  ... and {len(results) - 20} more")
 
     summary = aggregator.get_summary()
+    time_range = summary.get('time_range') or {}
     print(f"\nSummary:")
     print(f"  Total entries: {summary['total_entries']:,}")
-    print(f"  Time range: {summary.get('time_range', {}).get('start', 'N/A')} to {summary.get('time_range', {}).get('end', 'N/A')}")
+    print(f"  Time range: {time_range.get('start', 'N/A')} to {time_range.get('end', 'N/A')}")
     print(f"  Error rate: {summary.get('error_rate', 0)}%")
     print(f"  By level: {', '.join(f'{k}={v}' for k, v in summary.get('by_level', {}).items())}")
     print(f"  By service: {', '.join(f'{k}={v}' for k, v in summary.get('by_service', {}).items())}")
@@ -458,6 +577,9 @@ def main():
         aggregator.generate_html_report(args.output)
     else:
         aggregator.export_json(args.output)
+
+    if args.redaction_summary:
+        aggregator.export_redaction_summary(args.redaction_summary, args.redaction_summary_format)
 
     return 0
 

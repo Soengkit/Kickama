@@ -87,6 +87,22 @@ Alerts are sent to PagerDuty and Slack (#ops-alerts channel).
 
 ## Incident Response
 
+### Offline Log Redaction Summary
+
+When reviewing archived logs outside the ELK stack, generate an audit summary
+alongside the normal aggregation report:
+
+```bash
+python3 tools/log_aggregator.py \
+  --input "/var/log/tent/*.log" \
+  --output log_report.json \
+  --redaction-summary redaction-summary.json
+```
+
+For a human-readable report, use `--redaction-summary-format text`. The summary
+includes processed, malformed, and redacted-field counts per source file without
+exposing raw secret-looking values.
+
 ### Severity Levels
 
 | Level | Description | Examples | Response Time |
