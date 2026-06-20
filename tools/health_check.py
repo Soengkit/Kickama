@@ -33,6 +33,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -68,8 +69,9 @@ MEMORY_THRESHOLD_CRITICAL = 90
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
+def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int, float]:
     import http.client
+    start = time.time()
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.request("GET", path)
@@ -77,6 +79,7 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         status = resp.status
         body = resp.read().decode("utf-8", errors="replace")[:200]
         conn.close()
+        latency = (time.time() - start) * 1000
 
         if status == 200:
             result = "OK"
@@ -88,9 +91,10 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
             result = "CRITICAL"
             detail = f"HTTP {status}: {body[:100]}"
 
-        return result, detail, status
+        return result, detail, status, latency
     except Exception as e:
-        return "CRITICAL", str(e), 0
+        latency = (time.time() - start) * 1000
+        return "CRITICAL", str(e), 0, latency
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -201,8 +205,10 @@ def check_load_average() -> Tuple[str, str, float]:
 # ---------------------------------------------------------------------------
 
 def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+    timestamp = time.time()
     results: Dict[str, Any] = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.fromtimestamp(timestamp).isoformat(),
+        "timestamp_unix": timestamp,
         "hostname": socket.gethostname(),
         "services": {},
         "infrastructure": {},
@@ -216,13 +222,14 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
-        status, detail, code = check_http_service(
+        status, detail, code, latency = check_http_service(
             config["host"], config["port"], config["path"], config["timeout"]
         )
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
+            "latency_ms": round(latency, 3),
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
         }
         if status == "CRITICAL":
@@ -274,6 +281,45 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     return results
 
 
+def prometheus_escape_label(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def prometheus_metric_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_:]", "_", name)
+
+
+def format_prometheus(results: Dict[str, Any]) -> str:
+    lines = [
+        "# HELP tent_health_service_up Service health status from tools/health_check.py; 1 means OK or WARNING, 0 means CRITICAL.",
+        "# TYPE tent_health_service_up gauge",
+        "# HELP tent_health_service_latency_ms Service health check latency in milliseconds.",
+        "# TYPE tent_health_service_latency_ms gauge",
+        "# HELP tent_health_service_http_status_code HTTP status code returned by the service health endpoint; 0 means no response.",
+        "# TYPE tent_health_service_http_status_code gauge",
+        "# HELP tent_health_service_check_timestamp_seconds Unix timestamp when the service health check was recorded.",
+        "# TYPE tent_health_service_check_timestamp_seconds gauge",
+    ]
+
+    timestamp = float(results.get("timestamp_unix", time.time()))
+    for service_name in sorted(results["services"]):
+        check = results["services"][service_name]
+        labels = (
+            f'service="{prometheus_escape_label(service_name)}",'
+            f'endpoint="{prometheus_escape_label(check.get("endpoint", ""))}"'
+        )
+        metric_service = prometheus_metric_name("tent_health_service")
+        up = 0 if check.get("status") == "CRITICAL" else 1
+        code = int(check.get("code") or 0)
+        latency_ms = float(check.get("latency_ms") or 0)
+        lines.append(f"{metric_service}_up{{{labels}}} {up}")
+        lines.append(f"{metric_service}_latency_ms{{{labels}}} {latency_ms:.3f}")
+        lines.append(f"{metric_service}_http_status_code{{{labels}}} {code}")
+        lines.append(f"{metric_service}_check_timestamp_seconds{{{labels}}} {timestamp:.3f}")
+
+    return "\n".join(lines) + "\n"
+
+
 def print_health_report(results: Dict[str, Any]):
     print(f"\n{'='*60}")
     print(f"  HEALTH CHECK REPORT")
@@ -303,7 +349,8 @@ def print_health_report(results: Dict[str, Any]):
 def parse_args():
     parser = argparse.ArgumentParser(description="Health check tool")
     parser.add_argument("--service", "-s", help="Check specific service only")
-    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    parser.add_argument("--format", choices=["text", "json", "prometheus"], default="text", help="Output format")
+    parser.add_argument("--json", "-j", action="store_true", help="Deprecated alias for --format json")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
@@ -312,33 +359,40 @@ def parse_args():
 
 def main():
     args = parse_args()
+    output_format = "json" if args.json else args.format
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
-                if args.json:
+                results = run_health_checks(args.service, output_format == "json")
+                if output_format == "json":
                     print(json.dumps(results, indent=2))
+                elif output_format == "prometheus":
+                    print(format_prometheus(results), end="")
                 else:
                     print_health_report(results)
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
-        if args.json:
+        results = run_health_checks(args.service, output_format == "json")
+        if output_format == "json":
             output = json.dumps(results, indent=2)
             print(output)
+        elif output_format == "prometheus":
+            output = format_prometheus(results)
+            print(output, end="")
         else:
+            output = json.dumps(results, indent=2)
             print_health_report(results)
 
         if args.output:
             with open(args.output, "w") as f:
-                if args.json:
+                if output_format == "text":
                     json.dump(results, f, indent=2)
                 else:
-                    json.dump(results, f, indent=2)
+                    f.write(output)
             print(f"Report saved to {args.output}")
 
         if results["overall_status"] == "DEGRADED":
@@ -348,4 +402,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

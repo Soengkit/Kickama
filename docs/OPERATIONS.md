@@ -58,6 +58,16 @@ Key metrics to monitor:
 | `goroutine_count` | Gauge | Go routine count | > 5000 | > 10000 |
 | `gc_pause_time_ms` | Histogram | GC pause time | > 100ms | > 500ms |
 
+`tools/health_check.py --format prometheus` emits lightweight probe metrics for
+local monitoring adapters:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tent_health_service_up` | Gauge | `service`, `endpoint` | `1` for OK/WARNING service checks, `0` for CRITICAL checks |
+| `tent_health_service_latency_ms` | Gauge | `service`, `endpoint` | HTTP health endpoint latency in milliseconds |
+| `tent_health_service_http_status_code` | Gauge | `service`, `endpoint` | HTTP status code returned by the health endpoint, or `0` when no response was received |
+| `tent_health_service_check_timestamp_seconds` | Gauge | `service`, `endpoint` | Unix timestamp for when the check was recorded |
+
 ### Grafana Dashboards
 
 Pre-built Grafana dashboards are available:
