@@ -13,9 +13,11 @@ static arena_region_t *region_alloc(size_t size, uint32_t flags) {
     int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
     int mmap_prot = PROT_READ | PROT_WRITE;
 
+#ifdef MAP_HUGETLB
     if (flags & ARENA_HUGE_PAGES) {
         mmap_flags |= MAP_HUGETLB;
     }
+#endif
 
     void *addr = mmap(NULL, size, mmap_prot, mmap_flags, -1, 0);
     if (addr == MAP_FAILED) {
@@ -175,8 +177,10 @@ size_t arena_total_capacity(const arena_t *arena) {
 int arena_contains(const arena_t *arena, const void *ptr) {
     arena_region_t *region = arena->regions;
     while (region) {
-        if (ptr >= region->start &&
-            ptr < (char *)region->start + region->size) {
+        const char *candidate = (const char *)ptr;
+        const char *region_start = (const char *)region->start;
+        if (candidate >= region_start &&
+            candidate < region_start + region->size) {
             return 1;
         }
         region = region->next;
