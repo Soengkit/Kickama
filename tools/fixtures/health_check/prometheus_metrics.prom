@@ -1,0 +1,4 @@
+# HELP tent_backend_health_last_success Health check last success timestamp.
+# TYPE tent_backend_health_last_success gauge
+tent_backend_health_last_success{service="backend"} 1 1781949600000
+tent_backend_health_last_success{service="backend",token="ghp_should_not_leak_1234567890"} 1 1781946000000
