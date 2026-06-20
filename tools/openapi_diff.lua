@@ -39,6 +39,167 @@ local DIFF_COLOR_REMOVE = "\27[31m"
 local DIFF_COLOR_CHANGE = "\27[33m"
 local DIFF_COLOR_META = "\27[36m"
 local DIFF_COLOR_RESET = "\27[0m"
+local RED = DIFF_COLOR_REMOVE
+local YELLOW = DIFF_COLOR_CHANGE
+local RESET = DIFF_COLOR_RESET
+
+local HTTP_METHODS = {
+  get = true,
+  post = true,
+  put = true,
+  delete = true,
+  patch = true
+}
+
+local ORDER_INSENSITIVE_LISTS = {
+  required = true,
+  tags = true
+}
+
+local function trim(value)
+  return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function count_lines(content)
+  local count = 0
+  for _ in content:gmatch("[^\r\n]+") do
+    count = count + 1
+  end
+  return count
+end
+
+local function new_node(key, value)
+  return {
+    key = key,
+    value = value or "",
+    children = {}
+  }
+end
+
+local function add_child(parent, child)
+  table.insert(parent.children, child)
+  return child
+end
+
+local function parse_yaml_tree(content)
+  local root = new_node("<root>", "")
+  local stack = {
+    { indent = -1, node = root }
+  }
+  local block_scalar_indent = nil
+
+  for line in content:gmatch("[^\r\n]+") do
+    local indent = #(line:match("^(%s*)") or "")
+    local stripped = trim(line)
+
+    if stripped == "" or stripped:match("^#") then
+      goto continue
+    end
+
+    if block_scalar_indent and indent > block_scalar_indent then
+      goto continue
+    end
+    block_scalar_indent = nil
+
+    while #stack > 1 and indent <= stack[#stack].indent do
+      table.remove(stack)
+    end
+
+    local parent = stack[#stack].node
+    local child
+    local item = stripped:match("^%-%s*(.*)$")
+
+    if item then
+      child = add_child(parent, new_node("-", item))
+      local item_key, item_value = item:match("^([^:]+):%s*(.*)$")
+      if item_key and item_key ~= "" then
+        add_child(child, new_node(trim(item_key), item_value or ""))
+      end
+    else
+      local key, value = stripped:match("^([^:]+):%s*(.*)$")
+      if key then
+        child = add_child(parent, new_node(trim(key), value or ""))
+      end
+    end
+
+    if child then
+      if child.value == "" or child.value == "{}" or child.value == "[]" then
+        table.insert(stack, { indent = indent, node = child })
+      elseif child.value:match("^[>|]") then
+        block_scalar_indent = indent
+      end
+    end
+
+    ::continue::
+  end
+
+  return root
+end
+
+local function find_child(node, key)
+  for _, child in ipairs(node.children or {}) do
+    if child.key == key then
+      return child
+    end
+  end
+  return nil
+end
+
+local function sorted_children(node)
+  local children = {}
+  for _, child in ipairs(node.children or {}) do
+    table.insert(children, child)
+  end
+  table.sort(children, function(a, b)
+    if a.key == b.key then
+      return (a.value or "") < (b.value or "")
+    end
+    return a.key < b.key
+  end)
+  return children
+end
+
+local function canonicalize_node(node)
+  local pieces = {}
+  local children = sorted_children(node)
+
+  if node.key == "-" then
+    table.insert(pieces, "-=" .. (node.value or ""))
+  else
+    table.insert(pieces, node.key .. "=" .. (node.value or ""))
+  end
+
+  if #children > 0 then
+    local child_signatures = {}
+    for _, child in ipairs(children) do
+      table.insert(child_signatures, canonicalize_node(child))
+    end
+
+    if ORDER_INSENSITIVE_LISTS[node.key] then
+      table.sort(child_signatures)
+    end
+
+    table.insert(pieces, "{" .. table.concat(child_signatures, "|") .. "}")
+  end
+
+  return table.concat(pieces)
+end
+
+local function extract_path_signatures(root)
+  local signatures = {}
+  local paths_node = find_child(root, "paths")
+  if not paths_node then
+    return signatures
+  end
+
+  for _, child in ipairs(paths_node.children or {}) do
+    if child.key:match("^/") then
+      signatures[child.key] = canonicalize_node(child)
+    end
+  end
+
+  return signatures
+end
 
 -- =============================================================================
 -- YAML Keyword Parser
@@ -69,6 +230,9 @@ local function parse_yaml_keywords(filepath)
   local tags = {}
   local info_fields = {}
   local emoji_count = 0
+  local line_count = count_lines(content)
+  local root = parse_yaml_tree(content)
+  local path_signatures = extract_path_signatures(root)
   
   for line in content:gmatch("[^\r\n]+") do
     -- Elena's "parser": if a line has a colon, it is a key-value pair.
@@ -79,15 +243,14 @@ local function parse_yaml_keywords(filepath)
     local indent = line:match("^(%s*)")
     local indent_level = indent and #indent or 0
     
-    local key, value = line:match("^%s*([%w_%-]+):%s*(.*)")
+    local key, value = line:match("^%s*([%w_%-%./]+):%s*(.*)")
     if key then
       value = value or ""
       if indent_level < 4 and key == "paths" then
         paths.active = true
       elseif indent_level < 4 and key == "components" then
         schemas.active = true
-      elseif indent_level == 4 and (key == "get" or key == "post" or key == "put" 
-              or key == "delete" or key == "patch") then
+      elseif indent_level == 4 and HTTP_METHODS[key] then
         table.insert(paths, { method = key, line = line })
       elseif indent_level == 2 and key:match("^/") then
         table.insert(paths, { path = key, line = line })
@@ -107,8 +270,9 @@ local function parse_yaml_keywords(filepath)
     schemas = schemas,
     security = security,
     tags = tags,
+    path_signatures = path_signatures,
     emoji_count = emoji_count,
-    line_count = #content:gmatch("[^\r\n]+") or 0
+    line_count = line_count
   }
 end
 
@@ -165,9 +329,17 @@ local function compute_diff(left, right)
       table.insert(diff.removed, path)
     end
   end
+
+  for path, left_signature in pairs(left.path_signatures or {}) do
+    local right_signature = (right.path_signatures or {})[path]
+    if right_signature and left_signature ~= right_signature then
+      table.insert(diff.changed, path)
+    end
+  end
   
   table.sort(diff.added)
   table.sort(diff.removed)
+  table.sort(diff.changed)
   
   diff.summary = {
     added = #diff.added,

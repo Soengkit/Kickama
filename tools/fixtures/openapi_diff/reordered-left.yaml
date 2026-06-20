@@ -1,0 +1,26 @@
+openapi: 3.1.0
+info:
+  title: Ordering Fixture
+  version: 1.0.0
+paths:
+  /widgets:
+    get:
+      tags:
+        - Beta
+        - Alpha
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - id
+                  - name
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+
