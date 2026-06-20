@@ -36,6 +36,7 @@ import argparse
 import collections
 import csv
 import gzip
+import copy
 import io
 import json
 import logging
@@ -51,6 +52,73 @@ from collections import defaultdict, Counter
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
+
+SECRET_FIELD_PATTERN = re.compile(
+    r"(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|credential|authorization|auth)",
+    re.IGNORECASE,
+)
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\b[A-Za-z0-9._%+-]+:[A-Za-z0-9._%+-]+@"),
+    re.compile(r"\b(?:sk|pk|ghp|gho|github_pat)_[A-Za-z0-9_]{12,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+]
+REDACTION_MARKER = "[REDACTED]"
+
+
+def redact_text(value: str) -> Tuple[str, int]:
+    redactions = 0
+    redacted = value
+    for pattern in SECRET_VALUE_PATTERNS:
+        redacted, count = pattern.subn(REDACTION_MARKER, redacted)
+        redactions += count
+    return redacted, redactions
+
+
+def redact_value(key: str, value: Any) -> Tuple[Any, int]:
+    if SECRET_FIELD_PATTERN.search(str(key)):
+        return REDACTION_MARKER, 1
+    if isinstance(value, dict):
+        return redact_fields(value)
+    if isinstance(value, list):
+        redacted_items = []
+        total = 0
+        for item in value:
+            redacted, count = redact_value(key, item)
+            redacted_items.append(redacted)
+            total += count
+        return redacted_items, total
+    if isinstance(value, str):
+        return redact_text(value)
+    return value, 0
+
+
+def redact_fields(fields: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    redacted = {}
+    total = 0
+    for key, value in fields.items():
+        redacted_value, count = redact_value(key, value)
+        redacted[key] = redacted_value
+        total += count
+    return redacted, total
+
+
+def normalize_timestamp(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        for candidate in (value, value.replace("Z", "+00:00")):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp())
+            except ValueError:
+                continue
+    return None
 
 # ---------------------------------------------------------------------------
 # LOG PARSERS
@@ -206,6 +274,12 @@ class LogAggregator:
     def __init__(self):
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
         self.entries: List[Dict[str, Any]] = []
+        self.processed_count = 0
+        self.malformed_count = 0
+        self.redacted_field_count = 0
+        self.source_counts: Counter = Counter()
+        self.malformed_by_source: Counter = Counter()
+        self.redactions_by_source: Counter = Counter()
         self.level_counts: Counter = Counter()
         self.service_counts: Counter = Counter()
         self.hourly_counts: Counter = Counter()
@@ -219,12 +293,12 @@ class LogAggregator:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        if self._parse_line(line, filepath):
                             parsed_count += 1
             else:
                 with open(filepath, 'r', errors='replace') as f:
                     for line in f:
-                        if self._parse_line(line):
+                        if self._parse_line(line, filepath):
                             parsed_count += 1
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
@@ -240,10 +314,32 @@ class LogAggregator:
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
 
-    def _parse_line(self, line: str) -> bool:
+    def _parse_line(self, line: str, source: str = "<stream>") -> bool:
+        self.processed_count += 1
+        source_name = os.path.basename(source) if source else "<stream>"
+        self.source_counts[source_name] += 1
+        stripped = line.strip()
+        looks_like_json = stripped.startswith("{") or stripped.startswith("[")
         for parser in self.parsers:
+            if looks_like_json and not isinstance(parser, JSONLogParser):
+                continue
             entry = parser.parse(line)
             if entry:
+                entry = copy.deepcopy(entry)
+                fields = entry.get('fields') or {}
+                if isinstance(fields, dict):
+                    redacted_fields, redaction_count = redact_fields(fields)
+                    entry['fields'] = redacted_fields
+                else:
+                    redaction_count = 0
+                message, message_redactions = redact_text(str(entry.get('message', '')))
+                entry['message'] = message
+                entry['timestamp'] = normalize_timestamp(entry.get('timestamp'))
+                redaction_count += message_redactions
+                entry['source'] = source_name
+                if redaction_count:
+                    self.redacted_field_count += redaction_count
+                    self.redactions_by_source[source_name] += redaction_count
                 self.entries.append(entry)
                 ts = entry.get('timestamp')
                 if ts:
@@ -260,10 +356,23 @@ class LogAggregator:
                     self.errors_by_service[service].append(msg)
                     self.error_patterns[msg] += 1
                 return True
+        self.malformed_count += 1
+        self.malformed_by_source[source_name] += 1
         return False
 
     def get_summary(self) -> Dict[str, Any]:
         return {
+            'processed': self.processed_count,
+            'malformed': self.malformed_count,
+            'redacted_fields': self.redacted_field_count,
+            'sources': {
+                source: {
+                    'processed': count,
+                    'malformed': self.malformed_by_source.get(source, 0),
+                    'redacted_fields': self.redactions_by_source.get(source, 0),
+                }
+                for source, count in sorted(self.source_counts.items())
+            },
             'total_entries': len(self.entries),
             'time_range': self._get_time_range(),
             'by_level': dict(self.level_counts.most_common()),
@@ -383,6 +492,17 @@ th {{ background: #1e293b; color: #94a3b8; }}
   <div class="label">Total Log Entries Analyzed</div>
 </div>
 <div class="card">
+  <h2>Redaction Summary</h2>
+  <table>
+    <tr><th>Source</th><th>Processed</th><th>Malformed</th><th>Redacted Fields</th></tr>"""
+        for source, stats in summary.get('sources', {}).items():
+            html += (
+                f"<tr><td>{source}</td><td>{stats.get('processed', 0):,}</td>"
+                f"<td>{stats.get('malformed', 0):,}</td>"
+                f"<td>{stats.get('redacted_fields', 0):,}</td></tr>"
+            )
+        html += """</table></div>
+<div class="card">
   <h2>By Level</h2>
   <table>
     <tr><th>Level</th><th>Count</th><th>Percentage</th></tr>"""
@@ -447,6 +567,17 @@ def main():
     summary = aggregator.get_summary()
     print(f"\nSummary:")
     print(f"  Total entries: {summary['total_entries']:,}")
+    print(f"  Processed lines: {summary.get('processed', 0):,}")
+    print(f"  Malformed lines: {summary.get('malformed', 0):,}")
+    print(f"  Redacted fields: {summary.get('redacted_fields', 0):,}")
+    if summary.get('sources'):
+        print("  Sources:")
+        for source, stats in summary['sources'].items():
+            print(
+                f"    {source}: processed={stats.get('processed', 0)}, "
+                f"malformed={stats.get('malformed', 0)}, "
+                f"redacted_fields={stats.get('redacted_fields', 0)}"
+            )
     print(f"  Time range: {summary.get('time_range', {}).get('start', 'N/A')} to {summary.get('time_range', {}).get('end', 'N/A')}")
     print(f"  Error rate: {summary.get('error_rate', 0)}%")
     print(f"  By level: {', '.join(f'{k}={v}' for k, v in summary.get('by_level', {}).items())}")
