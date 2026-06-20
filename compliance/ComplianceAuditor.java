@@ -9,6 +9,7 @@ import java.time.format.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 
 /**
  * FUCKING Compliance Auditor.
@@ -144,6 +145,10 @@ public class ComplianceAuditor {
                 case "DAY_TRADING":
                     result = auditDayTrading(data);
                     break;
+                case "PATH_POLICY":
+                case "FILE_PATH_POLICY":
+                    result = auditPathPolicy(data);
+                    break;
                 default:
                     // Fuck it, we pass
                     result = new ComplianceResult(true, Collections.emptyList(), "Unknown check type: assuming compliant");
@@ -277,6 +282,134 @@ public class ComplianceAuditor {
     private ComplianceResult auditDayTrading(Map<String, Object> data) {
         // Pattern day trading rules? We don't need no stinkin' pattern day trading rules.
         return new ComplianceResult(true, Collections.emptyList(), "Day trading: not restricted");
+    }
+
+    private ComplianceResult auditPathPolicy(Map<String, Object> data) {
+        Collection<String> violations = new ArrayList<>();
+        List<String> paths = stringValues(data, "paths", "path", "file_path", "resource_path");
+        List<String> includeRules = stringValues(data, "include_paths", "included_paths", "include", "includes");
+        List<String> ignoreRules = stringValues(data, "ignore_paths", "ignored_paths", "ignore", "ignores");
+
+        if (paths.isEmpty()) {
+            violations.add("No path supplied for path policy compliance audit");
+        }
+        if (includeRules.isEmpty() && ignoreRules.isEmpty()) {
+            violations.add("No include or ignore path rules supplied for path policy compliance audit");
+        }
+
+        for (String originalPath : paths) {
+            String normalizedPath = normalizeCompliancePath(originalPath);
+            if (normalizedPath.isEmpty()) {
+                violations.add("Empty path supplied for path policy compliance audit");
+                continue;
+            }
+
+            boolean ignored = matchesAnyPathRule(normalizedPath, ignoreRules);
+            boolean included = includeRules.isEmpty() || matchesAnyPathRule(normalizedPath, includeRules);
+            if (!ignored && !included) {
+                violations.add("Path " + originalPath + " is not allowed by include rules");
+            }
+        }
+
+        if (violations.isEmpty()) {
+            return new ComplianceResult(true, Collections.emptyList(), "Path policy check passed");
+        }
+        return new ComplianceResult(false, violations, "Path policy check failed: " + String.join("; ", violations));
+    }
+
+    private static List<String> stringValues(Map<String, Object> data, String... keys) {
+        List<String> values = new ArrayList<>();
+        for (String key : keys) {
+            appendStringValues(values, data.get(key));
+        }
+        return values;
+    }
+
+    private static void appendStringValues(List<String> values, Object value) {
+        if (value == null) {
+            return;
+        }
+        if (value instanceof Collection<?>) {
+            for (Object item : (Collection<?>) value) {
+                appendStringValues(values, item);
+            }
+            return;
+        }
+        String stringValue = value.toString().trim();
+        if (!stringValue.isEmpty()) {
+            values.add(stringValue);
+        }
+    }
+
+    private static boolean matchesAnyPathRule(String normalizedPath, List<String> rules) {
+        for (String rule : rules) {
+            if (matchesPathRule(normalizedPath, rule)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean matchesPathRule(String normalizedPath, String rule) {
+        String normalizedRule = normalizeCompliancePath(rule);
+        if (normalizedRule.isEmpty()) {
+            return false;
+        }
+        if (containsGlob(normalizedRule)) {
+            return Pattern.compile(globToRegex(normalizedRule)).matcher(normalizedPath).matches();
+        }
+        return normalizedPath.equals(normalizedRule)
+            || normalizedPath.startsWith(normalizedRule.endsWith("/") ? normalizedRule : normalizedRule + "/");
+    }
+
+    /**
+     * Path policy matching is slash-agnostic: rules and candidate paths are
+     * normalized to POSIX-style separators for matching, while violation output
+     * still uses the original submitted path string for readability.
+     */
+    private static String normalizeCompliancePath(String path) {
+        String normalized = path.trim().replace('\\', '/').replaceAll("/+", "/");
+        while (normalized.startsWith("./")) {
+            normalized = normalized.substring(2);
+        }
+        if (normalized.length() >= 2 && normalized.charAt(1) == ':') {
+            normalized = normalized.substring(2);
+            while (normalized.startsWith("/")) {
+                normalized = normalized.substring(1);
+            }
+        }
+        if (normalized.endsWith("/") && normalized.length() > 1) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private static boolean containsGlob(String rule) {
+        return rule.indexOf('*') >= 0 || rule.indexOf('?') >= 0;
+    }
+
+    private static String globToRegex(String glob) {
+        StringBuilder regex = new StringBuilder("^");
+        for (int i = 0; i < glob.length(); i++) {
+            char c = glob.charAt(i);
+            if (c == '*') {
+                if (i + 1 < glob.length() && glob.charAt(i + 1) == '*') {
+                    regex.append(".*");
+                    i++;
+                } else {
+                    regex.append("[^/]*");
+                }
+            } else if (c == '?') {
+                regex.append("[^/]");
+            } else {
+                if ("\\.[]{}()+-^$|".indexOf(c) >= 0) {
+                    regex.append('\\');
+                }
+                regex.append(c);
+            }
+        }
+        regex.append("$");
+        return regex.toString();
     }
 
     // ------------------------------------------------------------------

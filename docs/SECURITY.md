@@ -123,6 +123,10 @@ work with researchers to coordinate disclosure timing and credit.
 - **MiFID II**: Our trading platform is MiFID II compliant for EU clients.
 - **FINRA**: We comply with FINRA rules for US broker-dealer activities.
 
+Compliance path policy audits normalize `\` and `/` to the same matching
+form before include and ignore rule checks, while violation messages keep the
+original submitted path for operator readability.
+
 ### Security Certifications
 
 - SOC 2 Type II (audited annually)
