@@ -70,6 +70,30 @@ Pre-built Grafana dashboards are available:
 | Business Metrics | Active users, trades, volume | `tot-business-metrics` |
 | Service Health | Per-service health and dependencies | `tot-service-health` |
 
+### AI Pipeline Timing Report
+
+`ai_pipeline.sh` prints a stage timing table at the end of every run. The
+table records each completed major stage in execution order with UTC start,
+finish, and elapsed seconds:
+
+```text
+Stage                        Start                Finish                Seconds
+-----                        -----                ------                -------
+data-preparation             2026-06-20T11:35:00Z 2026-06-20T11:35:03Z        3
+```
+
+The timing table is printed from the script exit handler, so interrupted or
+failed runs still include timings for stages that completed before exit. To
+also write machine-readable timings, set `AI_PIPELINE_TIMINGS_JSON` to an
+output path:
+
+```sh
+AI_PIPELINE_TIMINGS_JSON=metrics/ai_pipeline_timings.json ./ai_pipeline.sh --mode evaluate
+```
+
+The JSON output only contains stage names and timing values. It does not record
+command lines, environment variables, tokens, or other secret values.
+
 ### Alerting Rules
 
 Alerts are sent to PagerDuty and Slack (#ops-alerts channel).

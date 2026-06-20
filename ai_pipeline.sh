@@ -65,6 +65,14 @@ NC='\033[0m' # No Color
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$PROJECT_ROOT/logs/ai_pipeline_${TIMESTAMP}.log"
 
+# Timing state. Keep this intentionally free of command lines and environment
+# values so diagnostic logs cannot leak secrets through timing output.
+TIMING_NAMES=()
+TIMING_STARTS=()
+TIMING_FINISHES=()
+TIMING_ELAPSED=()
+TIMINGS_PRINTED=false
+
 # ---------------------------------------------------------------------------
 # Utility Functions
 # ---------------------------------------------------------------------------
@@ -86,6 +94,121 @@ log() {
     
     echo -e "${color}[${level}]${NC} ${message}"
     echo "[${TIMESTAMP}] [${level}] ${message}" >> "$LOG_FILE"
+}
+
+json_escape() {
+    local value="${1:-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    printf '"%s"' "$value"
+}
+
+record_timing() {
+    local name="$1"
+    local start_label="$2"
+    local finish_label="$3"
+    local elapsed="$4"
+
+    TIMING_NAMES+=("$name")
+    TIMING_STARTS+=("$start_label")
+    TIMING_FINISHES+=("$finish_label")
+    TIMING_ELAPSED+=("$elapsed")
+}
+
+write_timings_json() {
+    local output="${AI_PIPELINE_TIMINGS_JSON:-}"
+    if [ -z "$output" ]; then
+        return 0
+    fi
+
+    local output_dir
+    output_dir="$(dirname "$output")"
+    if ! mkdir -p "$output_dir" 2>/dev/null; then
+        log "WARN" "Could not create AI pipeline timings JSON directory"
+        return 0
+    fi
+
+    {
+        printf '{\n  "generated_at": '
+        json_escape "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        printf ',\n  "stages": [\n'
+        local i
+        for i in "${!TIMING_NAMES[@]}"; do
+            if [ "$i" -gt 0 ]; then
+                printf ',\n'
+            fi
+            printf '    {"name": '
+            json_escape "${TIMING_NAMES[$i]}"
+            printf ', "start": '
+            json_escape "${TIMING_STARTS[$i]}"
+            printf ', "finish": '
+            json_escape "${TIMING_FINISHES[$i]}"
+            printf ', "elapsed_seconds": %s}' "${TIMING_ELAPSED[$i]}"
+        done
+        printf '\n  ]\n}\n'
+    } > "$output" || {
+        log "WARN" "Could not write AI pipeline timings JSON"
+        return 0
+    }
+
+    log "INFO" "AI pipeline timings JSON written"
+}
+
+print_timing_table() {
+    if [ "$TIMINGS_PRINTED" = true ]; then
+        return 0
+    fi
+    TIMINGS_PRINTED=true
+
+    echo ""
+    log "STEP" "AI pipeline stage timings"
+
+    if [ "${#TIMING_NAMES[@]}" -eq 0 ]; then
+        log "INFO" "No pipeline stages recorded."
+        write_timings_json
+        return 0
+    fi
+
+    {
+        printf '%-28s %-20s %-20s %8s\n' "Stage" "Start" "Finish" "Seconds"
+        printf '%-28s %-20s %-20s %8s\n' "-----" "-----" "------" "-------"
+
+        local i
+        for i in "${!TIMING_NAMES[@]}"; do
+            printf '%-28s %-20s %-20s %8s\n' \
+                "${TIMING_NAMES[$i]}" \
+                "${TIMING_STARTS[$i]}" \
+                "${TIMING_FINISHES[$i]}" \
+                "${TIMING_ELAPSED[$i]}"
+        done
+    } | tee -a "$LOG_FILE"
+
+    write_timings_json
+}
+
+run_timed_stage() {
+    local name="$1"
+    shift
+
+    local start_epoch finish_epoch elapsed start_label finish_label rc
+    start_epoch=$(date +%s)
+    start_label=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    set +e
+    (
+        set -euo pipefail
+        "$@"
+    )
+    rc=$?
+    set -e
+
+    finish_epoch=$(date +%s)
+    finish_label=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    elapsed=$((finish_epoch - start_epoch))
+    record_timing "$name" "$start_label" "$finish_label" "$elapsed"
+
+    return "$rc"
 }
 
 check_dependency() {
@@ -321,6 +444,7 @@ main() {
     # Create directories and log file
     create_directories
     touch "$LOG_FILE"
+    trap 'print_timing_table' EXIT
     
     log "INFO" "Pipeline started at $(date)"
     log "INFO" "Model: $MODEL_NAME, LR: $LEARNING_RATE, Batch: $BATCH_SIZE, Epochs: $NUM_EPOCHS"
@@ -363,28 +487,28 @@ main() {
     # Execute pipeline phases based on mode
     case "$mode" in
         "full")
-            phase_data_preparation
-            phase_backend_training
-            phase_market_training
-            phase_frontend_training
-            phase_tools_training
-            phase_frailbox_training
-            phase_evaluation
-            phase_deployment
+            run_timed_stage "data-preparation" phase_data_preparation
+            run_timed_stage "backend-training" phase_backend_training
+            run_timed_stage "market-training" phase_market_training
+            run_timed_stage "frontend-quantization" phase_frontend_training
+            run_timed_stage "python-tools-training" phase_tools_training
+            run_timed_stage "frailbox-compilation" phase_frailbox_training
+            run_timed_stage "evaluation" phase_evaluation
+            run_timed_stage "deployment" phase_deployment
             ;;
         "train")
-            phase_data_preparation
-            phase_backend_training
-            phase_market_training
-            phase_frontend_training
-            phase_tools_training
-            phase_frailbox_training
+            run_timed_stage "data-preparation" phase_data_preparation
+            run_timed_stage "backend-training" phase_backend_training
+            run_timed_stage "market-training" phase_market_training
+            run_timed_stage "frontend-quantization" phase_frontend_training
+            run_timed_stage "python-tools-training" phase_tools_training
+            run_timed_stage "frailbox-compilation" phase_frailbox_training
             ;;
         "evaluate")
-            phase_evaluation
+            run_timed_stage "evaluation" phase_evaluation
             ;;
         "deploy")
-            phase_deployment
+            run_timed_stage "deployment" phase_deployment
             ;;
         *)
             log "ERROR" "Unknown mode: $mode"
@@ -410,6 +534,7 @@ main() {
     log "INFO" "  - Frailbox: $FRAILBOX_MODEL_DIR"
     log "INFO" "Logs:       $LOG_FILE"
     log "INFO" "Metrics:    $PROJECT_ROOT/metrics/evaluation_${TIMESTAMP}.txt"
+    print_timing_table
     echo ""
 }
 
