@@ -1,0 +1,26 @@
+{
+  "interactions": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/admin/health"
+      },
+      "expected_response": {
+        "status": 200,
+        "body": {
+          "status": "running",
+          "version": "3.2.0",
+          "uptime": "42s"
+        }
+      },
+      "actual_response": {
+        "status": 200,
+        "body": {
+          "status": "ok",
+          "version": "3.2.1",
+          "uptime": "43s"
+        }
+      }
+    }
+  ]
+}

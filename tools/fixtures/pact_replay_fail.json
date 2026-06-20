@@ -1,0 +1,54 @@
+{
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/auth/login"
+      },
+      "expected_response": {
+        "status": 200,
+        "body": {
+          "access_token": "token",
+          "expires_in": 3600,
+          "user": {
+            "id": "usr_123",
+            "email": "user@example.com"
+          }
+        }
+      },
+      "actual_response": {
+        "status": 401,
+        "body": {
+          "error": "invalid credentials",
+          "user": "missing"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/market/instruments",
+      "expected_status": 200,
+      "actual_status": 200,
+      "expected_body": {
+        "instruments": [
+          {
+            "id": "BTC-USD",
+            "symbol": "BTC/USD"
+          }
+        ],
+        "pagination": {
+          "page": 1,
+          "total": 100
+        }
+      },
+      "actual_body": {
+        "instruments": {
+          "id": "BTC-USD"
+        },
+        "pagination": {
+          "page": 1
+        }
+      }
+    }
+  ]
+}

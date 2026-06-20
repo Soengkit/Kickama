@@ -276,6 +276,29 @@ Audit logs are retained for 365 days and include:
 | Penetration test | Quarterly | External vendor |
 | Compliance audit | Annually | External auditor |
 
+## OpenAPI Pact Replay Triage
+
+When a pact replay fails, summarize the replay result before opening an
+incident ticket. The summary keeps one line per failing interaction and calls
+out the request method, path, expected and actual response status, and response
+body shape differences.
+
+Human-readable summary:
+
+```sh
+lua tools/openapi_pact.lua --replay-summary replay-result.json
+```
+
+Machine-readable summary for CI artifacts or chat-ops:
+
+```sh
+lua tools/openapi_pact.lua --replay-summary-json replay-result.json
+```
+
+Fixture inputs are available under `tools/fixtures/` for passing and failing
+replay examples. Use the JSON mode when attaching a compact artifact to an
+incident; use the text mode during live triage.
+
 ## Troubleshooting
 
 ### Common Issues

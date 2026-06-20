@@ -25,6 +25,8 @@
 --   lua tools/openapi_pact.lua                        # Generate all pacts
 --   lua tools/openapi_pact.lua --consumer web-app     # Filter by consumer
 --   lua tools/openapi_pact.lua --validate             # Validate existing pacts
+--   lua tools/openapi_pact.lua --replay-summary file  # Summarize replay mismatches
+--   lua tools/openapi_pact.lua --replay-summary-json file
 --   lua tools/openapi_pact.lua --help                  # Display this message
 --
 -- The --consumer flag filters the generated pacts to only include
@@ -40,6 +42,13 @@ local PACT_DIR = os.getenv("PACT_DIR") or "pacts"
 local SPEC_PATH = os.getenv("OPENAPI_SPEC_PATH") or "docs/openapi/v3.yaml"
 local DEFAULT_CONSUMER = "unknown-consumer"
 local DEFAULT_PROVIDER = "tent-of-trials-api"
+
+local GREEN = "\27[32m"
+local YELLOW = "\27[33m"
+local RED = "\27[31m"
+local CYAN = "\27[36m"
+local RESET = "\27[0m"
+local AJSON = { null = {} }
 
 -- =============================================================================
 -- Pact Generation Functions
@@ -396,6 +405,246 @@ local function validate_pacts()
 end
 
 -- =============================================================================
+-- Pact Replay Mismatch Summaries
+-- =============================================================================
+-- Replay failures usually arrive as a pile of raw expected/actual blobs. This
+-- summary keeps the operator view compact while preserving method, path, status,
+-- and response body shape differences for quick triage.
+
+local function json_array(items)
+  items = items or {}
+  items.__json_array = true
+  return items
+end
+
+local function read_text_file(path)
+  local file, err = io.open(path, "r")
+  if not file then
+    return nil, err or "could not open file"
+  end
+  local content = file:read("*all")
+  file:close()
+  return content
+end
+
+local function get_any(tbl, names)
+  if type(tbl) ~= "table" then return nil end
+  for _, name in ipairs(names) do
+    if tbl[name] ~= nil then
+      return tbl[name]
+    end
+  end
+  return nil
+end
+
+local function sorted_keys(tbl)
+  local keys = {}
+  if type(tbl) ~= "table" then return keys end
+  for key in pairs(tbl) do
+    if key ~= "__json_array" then
+      table.insert(keys, key)
+    end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys
+end
+
+local function value_kind(value)
+  if value == nil then return "missing" end
+  if value == AJSON.null then return "null" end
+  if type(value) ~= "table" then return type(value) end
+  if value.__json_array or #value > 0 then return "array" end
+  return "object"
+end
+
+local function shape_path(parent, key)
+  if parent == "" then
+    return tostring(key)
+  end
+  if type(key) == "number" then
+    return parent .. "[" .. tostring(key) .. "]"
+  end
+  return parent .. "." .. tostring(key)
+end
+
+local function add_shape_difference(diffs, path, expected_kind, actual_kind)
+  table.insert(diffs, {
+    path = path == "" and "$" or path,
+    expected = expected_kind,
+    actual = actual_kind
+  })
+end
+
+local function collect_shape_differences(expected, actual, path, diffs)
+  local expected_kind = value_kind(expected)
+  local actual_kind = value_kind(actual)
+  if expected_kind ~= actual_kind then
+    add_shape_difference(diffs, path, expected_kind, actual_kind)
+    return
+  end
+
+  if expected_kind == "object" then
+    local seen = {}
+    for _, key in ipairs(sorted_keys(expected)) do
+      seen[key] = true
+      collect_shape_differences(expected[key], actual and actual[key], shape_path(path, key), diffs)
+    end
+    for _, key in ipairs(sorted_keys(actual)) do
+      if not seen[key] then
+        collect_shape_differences(nil, actual[key], shape_path(path, key), diffs)
+      end
+    end
+  elseif expected_kind == "array" then
+    local expected_len = #expected
+    local actual_len = #(actual or {})
+    if expected_len ~= actual_len then
+      add_shape_difference(diffs, shape_path(path, "length"), tostring(expected_len), tostring(actual_len))
+    end
+    local limit = math.min(expected_len, actual_len, 3)
+    for i = 1, limit do
+      collect_shape_differences(expected[i], actual[i], shape_path(path, i), diffs)
+    end
+  end
+end
+
+local function stringify_mismatch(entry)
+  if type(entry) == "string" then return entry end
+  if type(entry) ~= "table" then return tostring(entry) end
+
+  local path = get_any(entry, { "path", "field", "json_path", "jsonPath" }) or "$"
+  local reason = get_any(entry, { "reason", "message", "type", "kind" }) or "mismatch"
+  local expected = get_any(entry, { "expected", "expected_type", "expectedType" })
+  local actual = get_any(entry, { "actual", "actual_type", "actualType" })
+  if expected ~= nil or actual ~= nil then
+    return string.format("%s: %s (expected %s, actual %s)", tostring(path), tostring(reason), tostring(expected), tostring(actual))
+  end
+  return string.format("%s: %s", tostring(path), tostring(reason))
+end
+
+local function list_from(value)
+  if type(value) ~= "table" then return json_array({}) end
+  if value.__json_array or #value > 0 then return value end
+  return json_array({ value })
+end
+
+local function summarize_replay_interaction(interaction)
+  local request = get_any(interaction, { "request", "expected_request", "expectedRequest" }) or {}
+  local expected = get_any(interaction, { "expected_response", "expectedResponse", "expected" }) or {}
+  local actual = get_any(interaction, { "actual_response", "actualResponse", "actual" }) or {}
+
+  local method = get_any(interaction, { "method" }) or get_any(request, { "method" }) or "UNKNOWN"
+  local path = get_any(interaction, { "path" }) or get_any(request, { "path", "url" }) or "UNKNOWN"
+  local expected_status = get_any(interaction, { "expected_status", "expectedStatus" }) or get_any(expected, { "status", "status_code", "statusCode" })
+  local actual_status = get_any(interaction, { "actual_status", "actualStatus" }) or get_any(actual, { "status", "status_code", "statusCode" })
+  local expected_body = get_any(interaction, { "expected_body", "expectedBody" }) or get_any(expected, { "body" })
+  local actual_body = get_any(interaction, { "actual_body", "actualBody" }) or get_any(actual, { "body" })
+  local raw_mismatches = get_any(interaction, { "mismatches", "body_mismatches", "bodyMismatches", "body_shape_differences", "bodyShapeDifferences" })
+  local notes = json_array({})
+
+  for _, mismatch in ipairs(list_from(raw_mismatches)) do
+    table.insert(notes, stringify_mismatch(mismatch))
+  end
+
+  local body_diffs = json_array({})
+  if expected_body ~= nil or actual_body ~= nil then
+    collect_shape_differences(expected_body, actual_body, "body", body_diffs)
+  end
+
+  local status_matches = expected_status == actual_status
+  local explicit_failed = get_any(interaction, { "failed", "failure" }) == true
+  local status_text = get_any(interaction, { "status", "result" })
+  if type(status_text) == "string" then
+    local normalized = status_text:lower()
+    explicit_failed = explicit_failed or normalized == "fail" or normalized == "failed" or normalized == "error"
+  end
+
+  local has_mismatch = explicit_failed or (expected_status ~= nil and actual_status ~= nil and not status_matches) or #body_diffs > 0 or #notes > 0
+  if not has_mismatch then
+    return nil
+  end
+
+  return {
+    method = method,
+    path = path,
+    status = {
+      expected = expected_status or "unknown",
+      actual = actual_status or "unknown",
+      matches = status_matches
+    },
+    response_body_differences = body_diffs,
+    notes = notes
+  }
+end
+
+local function build_replay_summary(replay)
+  local interactions = get_any(replay, { "interactions", "results", "replays", "mismatches" }) or {}
+  local summary = {
+    total_interactions = 0,
+    failed_interactions = 0,
+    mismatches = json_array({})
+  }
+
+  for _, interaction in ipairs(list_from(interactions)) do
+    summary.total_interactions = summary.total_interactions + 1
+    local mismatch = summarize_replay_interaction(interaction)
+    if mismatch then
+      summary.failed_interactions = summary.failed_interactions + 1
+      table.insert(summary.mismatches, mismatch)
+    end
+  end
+
+  return summary
+end
+
+local function print_replay_summary(summary)
+  print(string.format("[Pact] Replay summary: %d interaction(s), %d failing.", summary.total_interactions, summary.failed_interactions))
+  if summary.failed_interactions == 0 then
+    print(GREEN .. "[Pact] No replay mismatches found." .. RESET)
+    return
+  end
+
+  for index, mismatch in ipairs(summary.mismatches) do
+    print("")
+    print(string.format("%d. %s %s", index, tostring(mismatch.method), tostring(mismatch.path)))
+    print(string.format("   status: expected %s, actual %s", tostring(mismatch.status.expected), tostring(mismatch.status.actual)))
+    if #mismatch.response_body_differences > 0 then
+      print("   response body shape:")
+      for _, diff in ipairs(mismatch.response_body_differences) do
+        print(string.format("   - %s expected %s, actual %s", diff.path, tostring(diff.expected), tostring(diff.actual)))
+      end
+    end
+    if #mismatch.notes > 0 then
+      print("   notes:")
+      for _, note in ipairs(mismatch.notes) do
+        print("   - " .. note)
+      end
+    end
+  end
+end
+
+local function summarize_replay_file(path, as_json)
+  local content, err = read_text_file(path)
+  if not content then
+    print(RED .. "[Pact] Failed to read replay file: " .. tostring(err) .. RESET)
+    os.exit(1)
+  end
+
+  local ok, replay = pcall(decode_json, content)
+  if not ok or not replay or replay.parse_error then
+    print(RED .. "[Pact] Failed to parse replay JSON: " .. path .. RESET)
+    os.exit(1)
+  end
+
+  local summary = build_replay_summary(replay)
+  if as_json then
+    print(encode_json(summary))
+  else
+    print_replay_summary(summary)
+  end
+  return summary
+end
+
+-- =============================================================================
 -- JSON Parser (the inverse of the encoder in openapi_mock.lua)
 -- =============================================================================
 -- Elena needed a JSON parser for validation. She could have used a library.
@@ -523,7 +772,7 @@ function encode_json(obj, indent)
     -- This fails for tables that are intentionally empty arrays vs objects.
     -- Elena is aware of this. She has a note on her desk that says "fix this."
     -- The note has been there for 8 months. The note is yellowing.
-    local is_array = #obj > 0
+    local is_array = obj.__json_array == true or #obj > 0
     if is_array then
       local parts = {}
       for i, v in ipairs(obj) do
@@ -533,7 +782,11 @@ function encode_json(obj, indent)
     else
       local parts = {}
       local keys = {}
-      for k in pairs(obj) do table.insert(keys, k) end
+      for k in pairs(obj) do
+        if k ~= "__json_array" then
+          table.insert(keys, k)
+        end
+      end
       table.sort(keys)
       for _, k in ipairs(keys) do
         local v = obj[k]
@@ -559,12 +812,19 @@ end
 local args = {...}
 local mode = "generate"
 local consumer_name = DEFAULT_CONSUMER
+local replay_summary_path = nil
 
 for i, arg in ipairs(args) do
   if arg == "--consumer" and i < #args then
     consumer_name = args[i + 1]
   elseif arg == "--validate" then
     mode = "validate"
+  elseif arg == "--replay-summary" and i < #args then
+    mode = "replay_summary"
+    replay_summary_path = args[i + 1]
+  elseif arg == "--replay-summary-json" and i < #args then
+    mode = "replay_summary_json"
+    replay_summary_path = args[i + 1]
   elseif arg == "--help" then
     print("Tent of Trials OpenAPI Pact Generator")
     print("")
@@ -572,6 +832,8 @@ for i, arg in ipairs(args) do
     print("  lua tools/openapi_pact.lua                        Generate all pacts")
     print("  lua tools/openapi_pact.lua --consumer web-app     Filter by consumer")
     print("  lua tools/openapi_pact.lua --validate             Validate pacts")
+    print("  lua tools/openapi_pact.lua --replay-summary file  Print replay mismatch summary")
+    print("  lua tools/openapi_pact.lua --replay-summary-json file")
     print("")
     print("Elena wrote this tool during a particularly productive weekend.")
     print("She was house-sitting for a friend who had a cat named 'Monad.'")
@@ -583,12 +845,22 @@ for i, arg in ipairs(args) do
   end
 end
 
-print("")
+if mode ~= "replay_summary_json" then
+  print("")
+--[[
 print(CYAN .. "╔════════════════════════════════════════════════════╗" .. RESET)
 print(CYAN .. "║  Tent of Trials Pact Contract Generator          ║" .. RESET)
 print(CYAN .. "║  \"promises > code\"  -  Elena                       ║" .. RESET)
 print(CYAN .. "╚════════════════════════════════════════════════════╝" .. RESET)
 print("")
+
+]]
+  print(CYAN .. "====================================================" .. RESET)
+  print(CYAN .. "  Tent of Trials Pact Contract Generator" .. RESET)
+  print(CYAN .. "  promises > code  -  Elena" .. RESET)
+  print(CYAN .. "====================================================" .. RESET)
+  print("")
+end
 
 if mode == "generate" then
   print(GREEN .. "[Pact] Generating pacts for consumer: " .. consumer_name .. RESET)
@@ -607,6 +879,18 @@ if mode == "generate" then
   print(GREEN .. "[Pact] The cat's contributions are appreciated." .. RESET)
 elseif mode == "validate" then
   validate_pacts()
+elseif mode == "replay_summary" then
+  if not replay_summary_path then
+    print(RED .. "[Pact] --replay-summary requires a JSON replay result path." .. RESET)
+    os.exit(1)
+  end
+  summarize_replay_file(replay_summary_path, false)
+elseif mode == "replay_summary_json" then
+  if not replay_summary_path then
+    print(RED .. "[Pact] --replay-summary-json requires a JSON replay result path." .. RESET)
+    os.exit(1)
+  end
+  summarize_replay_file(replay_summary_path, true)
 end
 
 -- Elena's closing thoughts:
