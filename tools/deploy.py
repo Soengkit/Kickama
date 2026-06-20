@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,73 @@ ENVIRONMENTS = {
 }
 
 ROLLBACK_VERSIONS: Dict[str, List[str]] = {}
+
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\b[A-Za-z0-9._%+-]+:[A-Za-z0-9._%+-]+@"),
+    re.compile(r"\b(?:sk|pk|ghp|gho|github_pat)_[A-Za-z0-9_]{12,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+]
+REDACTION_MARKER = "[REDACTED]"
+
+
+def redact_text(value: str) -> str:
+    redacted = value
+    for pattern in SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(REDACTION_MARKER, redacted)
+    return redacted
+
+
+def build_rollback_summary(service: str, env: str, version: str) -> Dict:
+    env_config = ENVIRONMENTS[env]
+    service_config = SERVICES[service]
+    image = f"registry.example.com/tent/{service}:{version}"
+    return {
+        "service": service,
+        "service_name": service_config["name"],
+        "environment": env,
+        "namespace": env_config["namespace"],
+        "version": redact_text(version),
+        "image": redact_text(image),
+        "planned_actions": [
+            f"Set deployment/{service_config['name']} image to {redact_text(image)}",
+            f"Wait for rollout in namespace {env_config['namespace']}",
+            f"Run health check on {env_config['host']}:{service_config['port']}{service_config['health_endpoint']}",
+        ],
+        "risk_notes": [
+            "Dry-run only; no Kubernetes resources will be modified.",
+            "Rollback skips build and test steps and depends on the target image already existing.",
+            "Health check should be reviewed before considering the rollback complete.",
+        ],
+        "rollback_steps": [
+            f"python3 tools/deploy.py --env {env} --service {service} --rollback --version {redact_text(version)}",
+            "Monitor rollout status and service health after applying the rollback.",
+        ],
+    }
+
+
+def write_rollback_summary(summary: Dict, output_path: str, output_format: str):
+    if output_format == "json":
+        content = json.dumps(summary, indent=2)
+    else:
+        lines = [
+            "Rollback dry-run summary",
+            f"Service: {summary['service']} ({summary['service_name']})",
+            f"Environment: {summary['environment']}",
+            f"Namespace: {summary['namespace']}",
+            f"Version/tag: {summary['version']}",
+            "Planned actions:",
+        ]
+        lines.extend(f"- {item}" for item in summary["planned_actions"])
+        lines.append("Risk notes:")
+        lines.extend(f"- {item}" for item in summary["risk_notes"])
+        lines.append("Rollback steps:")
+        lines.extend(f"- {item}" for item in summary["rollback_steps"])
+        content = "\n".join(lines) + "\n"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"Rollback summary exported to {output_path}")
 
 
 def load_deployment_history(env: str) -> List[Dict]:
@@ -383,6 +451,10 @@ def parse_args():
     parser.add_argument("--version", help="Version to rollback to")
     parser.add_argument("--list", action="store_true", help="List deployments")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--rollback-summary-output",
+                       help="Write rollback dry-run summary to this path")
+    parser.add_argument("--rollback-summary-format", choices=["text", "json"], default="json",
+                       help="Format for --rollback-summary-output")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -404,7 +476,14 @@ def main():
             return 1
 
         if args.dry_run:
-            print(f"Would rollback {args.service} in {args.env} to {args.version}")
+            summary = build_rollback_summary(args.service, args.env, args.version)
+            print(f"Would rollback {args.service} in {args.env} to {redact_text(args.version)}")
+            if args.rollback_summary_output:
+                write_rollback_summary(
+                    summary,
+                    args.rollback_summary_output,
+                    args.rollback_summary_format,
+                )
             return 0
 
         success = rollback_service(args.service, args.env, args.version)
