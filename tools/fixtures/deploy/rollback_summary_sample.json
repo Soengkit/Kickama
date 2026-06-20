@@ -1,0 +1,11 @@
+{
+  "command": "python3 tools/deploy.py --env staging --service backend --rollback --version v3.1.0 --dry-run --rollback-summary-output /tmp/rollback-summary.json --rollback-summary-format json",
+  "expected_fields": [
+    "service",
+    "environment",
+    "version",
+    "planned_actions",
+    "risk_notes",
+    "rollback_steps"
+  ]
+}
