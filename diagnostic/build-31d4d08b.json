@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-06-20T19:41:33.026301+00:00",
+  "commit": "31d4d08b",
+  "diagnostic_logd": "diagnostic/build-31d4d08b.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "38b5989266442895af11",
+  "decrypt_command": "encryptly unpack diagnostic/build-31d4d08b.logd <outdir> --password 38b5989266442895af11",
+  "total_modules": 10,
+  "passed": 0,
+  "failed": 10,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0.02,
+      "artifact": null,
+      "output": "cargo unavailable in this WSL validation environment"
+    },
+    {
+      "name": "frontend",
+      "status": "FAIL",
+      "elapsed_seconds": 0.02,
+      "artifact": null,
+      "output": "npm install failed:\nnpm unavailable in this WSL validation environment\n"
+    },
+    {
+      "name": "market",
+      "status": "FAIL",
+      "elapsed_seconds": 0.018,
+      "artifact": null,
+      "output": "go unavailable in this WSL validation environment"
+    },
+    {
+      "name": "frailbox",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "make unavailable in this WSL validation environment"
+    },
+    {
+      "name": "engine",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "CMake configure failed:\ncmake unavailable in this WSL validation environment"
+    },
+    {
+      "name": "compliance",
+      "status": "FAIL",
+      "elapsed_seconds": 0.018,
+      "artifact": null,
+      "output": "javac unavailable in this WSL validation environment"
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "ruby unavailable in this WSL validation environment"
+    },
+    {
+      "name": "nfc-scanner",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "luac unavailable in this WSL validation environment"
+    },
+    {
+      "name": "openapi-haskell",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "ghc unavailable in this WSL validation environment"
+    },
+    {
+      "name": "openapi-tools",
+      "status": "FAIL",
+      "elapsed_seconds": 0.019,
+      "artifact": null,
+      "output": "luac unavailable in this WSL validation environment"
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-31d4d08b.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
