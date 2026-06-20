@@ -1,0 +1,44 @@
+{
+  "consumer": {
+    "name": "pact-replay-smoke"
+  },
+  "provider": {
+    "name": "tent-of-trials-api"
+  },
+  "interactions": [
+    {
+      "description": "health endpoint returns documented shape",
+      "request": {
+        "method": "GET",
+        "path": "/admin/health"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "healthy",
+          "version": "3.1.0",
+          "uptime_seconds": 120,
+          "services": {},
+          "notes": []
+        }
+      }
+    },
+    {
+      "description": "order book endpoint returns documented shape",
+      "request": {
+        "method": "GET",
+        "path": "/market/orderbook"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "symbol": "BTC/USD",
+          "bids": [],
+          "asks": [],
+          "timestamp": 1704070800000,
+          "sequence": 42
+        }
+      }
+    }
+  ]
+}

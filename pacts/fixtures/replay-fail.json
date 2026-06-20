@@ -1,0 +1,36 @@
+{
+  "consumer": {
+    "name": "pact-replay-smoke"
+  },
+  "provider": {
+    "name": "tent-of-trials-api"
+  },
+  "interactions": [
+    {
+      "description": "health endpoint with undocumented status",
+      "request": {
+        "method": "GET",
+        "path": "/admin/health"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "message": "not found"
+        }
+      }
+    },
+    {
+      "description": "order book endpoint missing response fields",
+      "request": {
+        "method": "GET",
+        "path": "/market/orderbook"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "symbol": "BTC/USD"
+        }
+      }
+    }
+  ]
+}

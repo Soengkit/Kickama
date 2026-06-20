@@ -41,6 +41,13 @@ local SPEC_PATH = os.getenv("OPENAPI_SPEC_PATH") or "docs/openapi/v3.yaml"
 local DEFAULT_CONSUMER = "unknown-consumer"
 local DEFAULT_PROVIDER = "tent-of-trials-api"
 
+local USE_COLOR = os.getenv("NO_COLOR") == nil
+local GREEN = USE_COLOR and "\27[32m" or ""
+local RED = USE_COLOR and "\27[31m" or ""
+local YELLOW = USE_COLOR and "\27[33m" or ""
+local CYAN = USE_COLOR and "\27[36m" or ""
+local RESET = USE_COLOR and "\27[0m" or ""
+
 -- =============================================================================
 -- Pact Generation Functions
 -- =============================================================================
@@ -396,6 +403,261 @@ local function validate_pacts()
 end
 
 -- =============================================================================
+-- Pact Replay
+-- =============================================================================
+-- Replay checks saved pact interactions against the local OpenAPI document.
+-- This is intentionally static and deterministic: it validates the method,
+-- path, response status, and top-level response body shape captured by the
+-- fixture without making network calls to a mock server.
+
+local function trim(str)
+  return (str or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function indent_of(line)
+  local spaces = line:match("^(%s*)") or ""
+  return #spaces
+end
+
+local function read_file(path)
+  local file, err = io.open(path, "r")
+  if not file then
+    return nil, err
+  end
+  local content = file:read("*all")
+  file:close()
+  return content
+end
+
+local function normalized_method(method)
+  return string.lower(trim(tostring(method or "")))
+end
+
+local function normalized_path(path)
+  path = tostring(path or "")
+  path = path:gsub("%?.*$", "")
+  return trim(path)
+end
+
+local function ensure_path(spec, path)
+  spec.paths[path] = spec.paths[path] or { methods = {} }
+  return spec.paths[path]
+end
+
+local function ensure_response(spec, path, method, status)
+  local path_spec = ensure_path(spec, path)
+  method = normalized_method(method)
+  path_spec.methods[method] = path_spec.methods[method] or { responses = {} }
+  status = tostring(status)
+  path_spec.methods[method].responses[status] =
+    path_spec.methods[method].responses[status] or { fields = {} }
+  return path_spec.methods[method].responses[status]
+end
+
+local HTTP_METHODS = {
+  get = true,
+  post = true,
+  put = true,
+  delete = true,
+  patch = true,
+  options = true,
+  head = true
+}
+
+local function add_field(fields, field)
+  if field and not fields[field] then
+    fields[field] = true
+    table.insert(fields, field)
+  end
+end
+
+local function parse_openapi_spec(path)
+  local content, err = read_file(path)
+  if not content then
+    return nil, "could not read spec: " .. tostring(err)
+  end
+
+  local spec = { paths = {}, schemas = {} }
+  local current_path = nil
+  local current_method = nil
+  local current_status = nil
+  local current_schema = nil
+  local current_schema_props_indent = nil
+  local current_response_props_indent = nil
+  local in_components_schemas = false
+
+  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+    local stripped = trim(line)
+    local indent = indent_of(line)
+
+    local path_name = line:match("^  (/[^:]+):%s*$")
+    if path_name then
+      current_path = path_name
+      current_method = nil
+      current_status = nil
+      current_response_props_indent = nil
+      in_components_schemas = false
+      current_schema = nil
+      current_schema_props_indent = nil
+      ensure_path(spec, current_path)
+    end
+
+    local method = line:match("^%s*([a-z]+):%s*$")
+    if current_path and method and HTTP_METHODS[method] then
+      current_method = method
+      current_status = nil
+      current_response_props_indent = nil
+      ensure_path(spec, current_path).methods[method] =
+        ensure_path(spec, current_path).methods[method] or { responses = {} }
+    end
+
+    local status = line:match("^        ['\"]?(%d%d%d)['\"]?:")
+    if current_path and current_method and status then
+      current_status = status
+      current_response_props_indent = nil
+      ensure_response(spec, current_path, current_method, current_status)
+    end
+
+    local response_ref = stripped:match("^%$ref:%s*['\"]?#/components/schemas/([%w_-]+)['\"]?")
+    if current_path and current_method and current_status and response_ref then
+      ensure_response(spec, current_path, current_method, current_status).schema_ref = response_ref
+    end
+
+    if current_path and current_method and current_status and stripped == "properties:" then
+      current_response_props_indent = indent
+    elseif current_response_props_indent and indent <= current_response_props_indent and stripped ~= "" then
+      current_response_props_indent = nil
+    end
+
+    if current_path and current_method and current_status and current_response_props_indent then
+      local field = line:match("^%s+([%w_-]+):%s*$")
+      if field and indent == current_response_props_indent + 2 then
+        add_field(ensure_response(spec, current_path, current_method, current_status).fields, field)
+      end
+    end
+
+    if stripped == "schemas:" and indent == 2 then
+      in_components_schemas = true
+      current_path = nil
+      current_method = nil
+      current_status = nil
+      current_response_props_indent = nil
+    elseif in_components_schemas and indent <= 2 and stripped ~= "" and stripped ~= "schemas:" then
+      in_components_schemas = false
+    end
+
+    if in_components_schemas then
+      local schema_name = line:match("^    ([%w_-]+):%s*$")
+      if schema_name then
+        current_schema = schema_name
+        spec.schemas[current_schema] = spec.schemas[current_schema] or { fields = {} }
+        current_schema_props_indent = nil
+      elseif current_schema and stripped == "properties:" then
+        current_schema_props_indent = indent
+      elseif current_schema_props_indent and indent <= current_schema_props_indent and stripped ~= "" then
+        current_schema_props_indent = nil
+      elseif current_schema and current_schema_props_indent then
+        local field = line:match("^%s+([%w_-]+):%s*$")
+        if field and indent == current_schema_props_indent + 2 then
+          add_field(spec.schemas[current_schema].fields, field)
+        end
+      end
+    end
+  end
+
+  return spec
+end
+
+local function response_fields_for(spec, response)
+  if response.schema_ref and spec.schemas[response.schema_ref] then
+    return spec.schemas[response.schema_ref].fields
+  end
+  return response.fields or {}
+end
+
+local function validate_interaction(spec, interaction)
+  local errors = {}
+  local request = interaction.request or {}
+  local response = interaction.response or {}
+  local method = normalized_method(request.method)
+  local path = normalized_path(request.path)
+  local status = tostring(response.status or "")
+
+  local path_spec = spec.paths[path]
+  if not path_spec then
+    table.insert(errors, "path not in spec: " .. path)
+    return errors
+  end
+
+  local method_spec = path_spec.methods[method]
+  if not method_spec then
+    table.insert(errors, "method not in spec: " .. string.upper(method) .. " " .. path)
+    return errors
+  end
+
+  local response_spec = method_spec.responses[status]
+  if not response_spec then
+    table.insert(errors, "status not in spec: " .. status)
+    return errors
+  end
+
+  local fields = response_fields_for(spec, response_spec)
+  local body = response.body or {}
+  for _, field in ipairs(fields) do
+    if body[field] == nil then
+      table.insert(errors, "response body missing field: " .. field)
+    end
+  end
+
+  return errors
+end
+
+local function replay_pact_fixture(fixture_path)
+  local spec, spec_err = parse_openapi_spec(SPEC_PATH)
+  if not spec then
+    print("FAIL spec " .. spec_err)
+    return 1
+  end
+
+  local content, err = read_file(fixture_path)
+  if not content then
+    print("FAIL fixture could not read " .. fixture_path .. ": " .. tostring(err))
+    return 1
+  end
+
+  local fixture = decode_json(content)
+  if fixture.parse_error then
+    print("FAIL fixture invalid JSON " .. fixture_path)
+    return 1
+  end
+
+  local interactions = fixture.interactions or fixture
+  if type(interactions) ~= "table" or #interactions == 0 then
+    print("FAIL fixture has no interactions")
+    return 1
+  end
+
+  local failures = 0
+  print("[Pact Replay] " .. fixture_path)
+  for index, interaction in ipairs(interactions) do
+    local description = interaction.description or ("interaction-" .. tostring(index))
+    local errors = validate_interaction(spec, interaction)
+    if #errors == 0 then
+      print(string.format("PASS %03d %s", index, description))
+    else
+      failures = failures + 1
+      print(string.format("FAIL %03d %s: %s", index, description, table.concat(errors, "; ")))
+    end
+  end
+  print(string.format("[Pact Replay] %d interaction(s), %d failure(s)", #interactions, failures))
+
+  if failures > 0 then
+    return 1
+  end
+  return 0
+end
+
+-- =============================================================================
 -- JSON Parser (the inverse of the encoder in openapi_mock.lua)
 -- =============================================================================
 -- Elena needed a JSON parser for validation. She could have used a library.
@@ -559,12 +821,16 @@ end
 local args = {...}
 local mode = "generate"
 local consumer_name = DEFAULT_CONSUMER
+local replay_path = nil
 
 for i, arg in ipairs(args) do
   if arg == "--consumer" and i < #args then
     consumer_name = args[i + 1]
   elseif arg == "--validate" then
     mode = "validate"
+  elseif (arg == "--replay" or arg == "replay") and i < #args then
+    mode = "replay"
+    replay_path = args[i + 1]
   elseif arg == "--help" then
     print("Tent of Trials OpenAPI Pact Generator")
     print("")
@@ -572,13 +838,8 @@ for i, arg in ipairs(args) do
     print("  lua tools/openapi_pact.lua                        Generate all pacts")
     print("  lua tools/openapi_pact.lua --consumer web-app     Filter by consumer")
     print("  lua tools/openapi_pact.lua --validate             Validate pacts")
+    print("  lua tools/openapi_pact.lua --replay fixtures/pact_replay_pass.json")
     print("")
-    print("Elena wrote this tool during a particularly productive weekend.")
-    print("She was house-sitting for a friend who had a cat named 'Monad.'")
-    print("The cat is named after the functional programming concept.")
-    print("The friend is a Haskell developer. The cat is named Monad.")
-    print("Monad the cat is now mentioned in 3 different programming tools.")
-    print("Monad the cat has not consented to this. Monad the cat cannot speak.")
     os.exit(0)
   end
 end
@@ -607,6 +868,12 @@ if mode == "generate" then
   print(GREEN .. "[Pact] The cat's contributions are appreciated." .. RESET)
 elseif mode == "validate" then
   validate_pacts()
+elseif mode == "replay" then
+  if not replay_path then
+    print("FAIL replay requires a fixture path")
+    os.exit(1)
+  end
+  os.exit(replay_pact_fixture(replay_path))
 end
 
 -- Elena's closing thoughts:

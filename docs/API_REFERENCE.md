@@ -181,6 +181,22 @@ Returns the current order book for an instrument.
 }
 ```
 
+## Pact Replay
+
+Saved consumer pact fixtures can be replayed against the local OpenAPI
+specification without calling a live service:
+
+```bash
+lua tools/openapi_pact.lua --replay pacts/fixtures/replay-pass.json
+```
+
+Replay validates each interaction's request method, request path, response
+status, and top-level JSON response fields against `docs/openapi/v3.yaml`.
+It prints deterministic `PASS` or `FAIL` lines for each interaction and exits
+with a non-zero status when any interaction fails. The repository includes
+`pacts/fixtures/replay-pass.json` and `pacts/fixtures/replay-fail.json` as
+small smoke fixtures for the replay path.
+
 ### GET /market/ticker
 
 Returns the current ticker for an instrument.
