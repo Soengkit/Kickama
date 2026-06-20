@@ -1,0 +1,5 @@
+{"timestamp":"2026-06-20T10:00:00","level":"INFO","service":"auth","message":"login accepted","user":"alice"}
+{"timestamp":"2026-06-20T10:01:00","level":"ERROR","service":"billing","message":"payment failed Bearer abcdefghijklmnop","api_key":"sk_test_abcdefghijklmnopqrstuvwxyz","nested":{"password":"hunter2"}}
+{"timestamp":"2026-06-20T10:02:00","level":"WARN","service":"gateway","message":"upstream retry"}
+{"timestamp":"2026-06-20T10:03:00","level":"INFO","service":"auth","message":"callback https://client:secret@example.test/path"}
+{"timestamp":"2026-06-20T10:04:00","level":"INFO","service":"bad","message":"missing brace"
