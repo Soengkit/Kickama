@@ -720,7 +720,8 @@ Diagnostic bundle:
         print(f"\n  {color('⚠ Some tools missing  -  will try anyway:', Colors.YELLOW)}")
         for m in missing:
             print(f"    {m}")
-        print(f"  {color('Not all modules will build. That\'s fine.', Colors.GRAY)}")
+        missing_tools_note = "Not all modules will build. That's fine."
+        print(f"  {color(missing_tools_note, Colors.GRAY)}")
     else:
         print(f"  {color('✓ All prerequisites found', Colors.GREEN)}")
 
