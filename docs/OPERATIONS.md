@@ -57,6 +57,28 @@ Key metrics to monitor:
 | `queue_depth` | Gauge | Message queue depth | > 1000 | > 10000 |
 | `goroutine_count` | Gauge | Go routine count | > 5000 | > 10000 |
 | `gc_pause_time_ms` | Histogram | GC pause time | > 100ms | > 500ms |
+| `tot_health_check_status` | Gauge | Health check status (0=OK,1=WARNING,2=CRITICAL) | WARNING | CRITICAL |
+| `tot_health_check_metric_stale` | Gauge | 1 if metric timestamp is stale | > 0 stale metrics | > 0 stale metrics |
+| `tot_health_check_metric_age_seconds` | Gauge | Age of health metric in seconds | > 300s | > 600s |
+
+### Stale-Metric Guard
+
+The `tools/health_check.py` tool exports Prometheus metrics with a
+stale-metric guard. Before export, every metric is annotated with its age
+(`tot_health_check_metric_age_seconds`) and a stale flag
+(`tot_health_check_metric_stale`). A metric is considered stale when its
+timestamp is older than `STALE_METRIC_THRESHOLD_SECONDS` (default 300s,
+overridable via `--stale-threshold` or the
+`STALE_METRIC_THRESHOLD_SECONDS` environment variable). Metrics without a
+usable timestamp are reported as stale so outdated data is never silently
+exported.
+
+Use `python3 tools/health_check.py --prometheus` to emit the exposition
+format. The JSON output (`--json`) includes a `stale_metrics` array whose
+entries carry `service`, `environment`, `metric_name`, `timestamp`,
+`age_seconds`, and `stale` for each metric. Secret-looking values
+(passwords, tokens, API keys) are redacted from the exported diagnostic
+output.
 
 ### Grafana Dashboards
 

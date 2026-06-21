@@ -38,6 +38,7 @@ import ssl
 import subprocess
 import sys
 import time
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,11 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+
+# Stale-metric guard configuration
+STALE_METRIC_THRESHOLD_SECONDS = int(os.environ.get("STALE_METRIC_THRESHOLD_SECONDS", "300"))
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
+_STATUS_TO_VALUE = {"OK": 0, "WARNING": 1, "CRITICAL": 2}
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
@@ -300,10 +306,159 @@ def print_health_report(results: Dict[str, Any]):
     print()
 
 
+# ---------------------------------------------------------------------------
+# PROMETHEUS EXPORT & STALE-METRIC GUARD
+# ---------------------------------------------------------------------------
+
+def redact_secrets(text: str) -> str:
+    """Redact secret-looking values from diagnostic/output text."""
+    if not text:
+        return text
+    text = re.sub(
+        r'(?i)((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)\s*[:=]\s*)[^\s,;"\']+',
+        r'\1REDACTED',
+        text,
+    )
+    text = re.sub(r'(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;"\']+', r'\1REDACTED', text)
+    text = re.sub(r'ghp_[A-Za-z0-9]{20,}', 'ghp_REDACTED', text)
+    text = re.sub(r'sk-[A-Za-z0-9]{20,}', 'sk-REDACTED', text)
+    return text
+
+
+def _escape_prometheus_label(value) -> str:
+    """Escape a value for safe use inside a Prometheus label."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def collect_health_metrics(results: Dict[str, Any], environment: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Flatten health check results into metric records for stale reporting.
+
+    Each record carries service, environment, metric name, timestamp and status.
+    """
+    environment = environment or ENVIRONMENT
+    timestamp = results.get("timestamp")
+    metrics: List[Dict[str, Any]] = []
+
+    for service_name, info in results.get("services", {}).items():
+        metrics.append({
+            "service": service_name,
+            "environment": environment,
+            "metric_name": f"service.{service_name}.status",
+            "timestamp": timestamp,
+            "status": info.get("status") if isinstance(info, dict) else None,
+        })
+        if isinstance(info, dict):
+            for sub_name, sub_info in info.items():
+                if sub_name != "status" and isinstance(sub_info, dict) and "status" in sub_info:
+                    metrics.append({
+                        "service": service_name,
+                        "environment": environment,
+                        "metric_name": f"service.{service_name}.{sub_name}.status",
+                        "timestamp": timestamp,
+                        "status": sub_info.get("status"),
+                    })
+
+    for infra_name, info in results.get("infrastructure", {}).items():
+        metrics.append({
+            "service": infra_name,
+            "environment": environment,
+            "metric_name": f"infrastructure.{infra_name}.status",
+            "timestamp": timestamp,
+            "status": info.get("status") if isinstance(info, dict) else None,
+        })
+
+    for sys_name, info in results.get("system", {}).items():
+        metrics.append({
+            "service": "system",
+            "environment": environment,
+            "metric_name": f"system.{sys_name}.status",
+            "timestamp": timestamp,
+            "status": info.get("status") if isinstance(info, dict) else None,
+        })
+
+    return metrics
+
+
+def flag_stale_metrics(
+    metrics: List[Dict[str, Any]],
+    now: Optional[datetime] = None,
+    threshold: int = STALE_METRIC_THRESHOLD_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Annotate each metric with age_seconds and a stale flag.
+
+    A metric is stale when its timestamp is older than ``threshold`` seconds
+    relative to ``now``. Metrics without a usable timestamp are reported as
+    stale so outdated data is never silently exported.
+    """
+    now = now or datetime.now()
+    if isinstance(now, str):
+        now = datetime.fromisoformat(now)
+
+    flagged: List[Dict[str, Any]] = []
+    for metric in metrics:
+        record = dict(metric)
+        timestamp = record.get("timestamp")
+        age_seconds: Optional[float] = None
+        stale = True
+        if timestamp is not None:
+            try:
+                collected_at = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else timestamp
+                age_seconds = (now - collected_at).total_seconds()
+                stale = age_seconds > threshold
+            except (ValueError, TypeError):
+                age_seconds = None
+                stale = True
+        record["age_seconds"] = round(age_seconds, 3) if age_seconds is not None else None
+        record["stale"] = bool(stale)
+        flagged.append(record)
+    return flagged
+
+
+def format_prometheus(
+    results: Dict[str, Any],
+    now: Optional[datetime] = None,
+    threshold: int = STALE_METRIC_THRESHOLD_SECONDS,
+    environment: Optional[str] = None,
+) -> str:
+    """Render health check results as Prometheus exposition text.
+
+    Stale metrics are flagged via ``tot_health_check_metric_stale`` so scrapers
+    can alert before exporting outdated data. Secret-looking values are redacted.
+    """
+    metrics = flag_stale_metrics(
+        collect_health_metrics(results, environment=environment),
+        now=now,
+        threshold=threshold,
+    )
+    lines = [
+        "# HELP tot_health_check_status Health check status (0=OK,1=WARNING,2=CRITICAL).",
+        "# TYPE tot_health_check_status gauge",
+        "# HELP tot_health_check_metric_stale 1 if the metric timestamp is stale, 0 otherwise.",
+        "# TYPE tot_health_check_metric_stale gauge",
+        "# HELP tot_health_check_metric_age_seconds Age of the metric in seconds.",
+        "# TYPE tot_health_check_metric_age_seconds gauge",
+    ]
+    for metric in metrics:
+        labels = (
+            f'service="{_escape_prometheus_label(metric.get("service", ""))}",'
+            f'environment="{_escape_prometheus_label(metric.get("environment", ""))}",'
+            f'metric="{_escape_prometheus_label(metric.get("metric_name", ""))}"'
+        )
+        status_value = _STATUS_TO_VALUE.get(str(metric.get("status")).upper(), 2)
+        stale_value = 1 if metric.get("stale") else 0
+        lines.append(f"tot_health_check_status{{{labels}}} {status_value}")
+        lines.append(f"tot_health_check_metric_stale{{{labels}}} {stale_value}")
+        if metric.get("age_seconds") is not None:
+            lines.append(f"tot_health_check_metric_age_seconds{{{labels}}} {metric['age_seconds']}")
+    return redact_secrets("\n".join(lines) + "\n")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Health check tool")
     parser.add_argument("--service", "-s", help="Check specific service only")
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    parser.add_argument("--prometheus", "-p", action="store_true", help="Prometheus exposition output with stale-metric guard")
+    parser.add_argument("--stale-threshold", type=int, default=STALE_METRIC_THRESHOLD_SECONDS, help="Seconds after which a metric is considered stale")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
@@ -318,7 +473,12 @@ def main():
         try:
             while True:
                 results = run_health_checks(args.service, args.json)
-                if args.json:
+                results["stale_metrics"] = flag_stale_metrics(
+                    collect_health_metrics(results), threshold=args.stale_threshold
+                )
+                if args.prometheus:
+                    print(format_prometheus(results, threshold=args.stale_threshold))
+                elif args.json:
                     print(json.dumps(results, indent=2))
                 else:
                     print_health_report(results)
@@ -327,15 +487,22 @@ def main():
             print("\nMonitoring stopped")
     else:
         results = run_health_checks(args.service, args.json)
-        if args.json:
-            output = json.dumps(results, indent=2)
-            print(output)
+        results["stale_metrics"] = flag_stale_metrics(
+            collect_health_metrics(results), threshold=args.stale_threshold
+        )
+
+        if args.prometheus:
+            print(format_prometheus(results, threshold=args.stale_threshold))
+        elif args.json:
+            print(json.dumps(results, indent=2))
         else:
             print_health_report(results)
 
         if args.output:
             with open(args.output, "w") as f:
-                if args.json:
+                if args.prometheus:
+                    f.write(format_prometheus(results, threshold=args.stale_threshold))
+                elif args.json:
                     json.dump(results, f, indent=2)
                 else:
                     json.dump(results, f, indent=2)
