@@ -15,6 +15,25 @@
 
 ## Monitoring
 
+### Bounty Issue Template Validation
+
+Before publishing a fork bounty issue, validate the Markdown issue body:
+
+```bash
+python3 tools/validate_bounty_issue.py path/to/issue-body.md
+```
+
+The validator checks for the required bounty, acceptance criteria, commissions,
+and validation sections. It also rejects validation text that does not require a
+real `diagnostic/build-*.logd` bundle or fails to exclude the
+`diagnostic/build-00000000.logd` stub.
+
+For CI or batch checks, emit machine-readable results:
+
+```bash
+python3 tools/validate_bounty_issue.py --json path/to/issue-body.md
+```
+
 ### Health Check Endpoints
 
 Each service exposes a health check endpoint:
