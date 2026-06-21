@@ -58,6 +58,11 @@ const API_VERSION_HEADER = 'X-API-Version';
 // Some internal services still use this header because they haven't
 // been updated. We send both the legacy and new auth headers.
 const LEGACY_API_KEY_HEADER = 'X-API-Key';
+const AUTH_TOKEN_KEY = 'auth_token';
+const REFRESH_TOKEN_KEY = 'refresh_token';
+const AUTH_STORAGE_KEY = 'tot_auth_tokens';
+const USER_STORAGE_KEY = 'tot_user_data';
+const AUTH_REFRESH_PATH = '/auth/refresh';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -149,7 +154,7 @@ export function addErrorInterceptor(interceptor: ErrorInterceptor): () => void {
 // Default request interceptor: adds auth headers
 addRequestInterceptor((config) => {
   const headers = config.headers as Record<string, string> || {};
-  const token = localStorage.getItem('auth_token');
+  const token = getStoredAccessToken();
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
     // Legacy auth header for internal services
@@ -182,9 +187,7 @@ addResponseInterceptor(<T>(response: ApiResponse<T>): ApiResponse<T> => {
 // Default error interceptor: handles common error patterns
 addErrorInterceptor((error: ApiError): ApiError => {
   if (error.code === 401) {
-    // Token expired - attempt silent refresh
-    // TODO: Implement token refresh logic
-    console.warn('[API] Authentication failed, attempting token refresh...');
+    console.warn('[API] Authentication failed after refresh handling.');
   }
   if (error.code === 429) {
     console.warn('[API] Rate limit exceeded, retrying with backoff...');
@@ -194,6 +197,199 @@ addErrorInterceptor((error: ApiError): ApiError => {
 
 function generateTraceId(): string {
   return `tot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+interface StoredAuthTokens {
+  accessToken?: string;
+  refreshToken?: string;
+  token?: string;
+  tokenType?: string;
+  expiresIn?: number;
+  scope?: string;
+}
+
+let refreshInFlight: Promise<string | null> | null = null;
+
+function getStoredAuthTokens(): StoredAuthTokens | null {
+  try {
+    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+    return raw ? JSON.parse(raw) as StoredAuthTokens : null;
+  } catch {
+    return null;
+  }
+}
+
+function getStoredAccessToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY)
+      || getStoredAuthTokens()?.accessToken
+      || getStoredAuthTokens()?.token
+      || null;
+  } catch {
+    return null;
+  }
+}
+
+function getStoredRefreshToken(): string | null {
+  try {
+    return localStorage.getItem(REFRESH_TOKEN_KEY)
+      || getStoredAuthTokens()?.refreshToken
+      || null;
+  } catch {
+    return null;
+  }
+}
+
+function storeRefreshedTokens(tokens: StoredAuthTokens): void {
+  const accessToken = tokens.accessToken || tokens.token;
+  const refreshToken = tokens.refreshToken;
+  try {
+    if (accessToken) {
+      localStorage.setItem(AUTH_TOKEN_KEY, accessToken);
+    }
+    if (refreshToken) {
+      localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+    }
+    const existing = getStoredAuthTokens() || {};
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({
+      ...existing,
+      ...tokens,
+      accessToken,
+      refreshToken: refreshToken || existing.refreshToken,
+    }));
+  } catch {
+    // Ignore storage failures; the retried request can still use in-memory data.
+  }
+}
+
+function clearAuthState(): void {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(USER_STORAGE_KEY);
+  } catch {
+    // localStorage may be unavailable in SSR or restricted browser contexts.
+  }
+}
+
+function extractRefreshPayload(data: unknown): StoredAuthTokens {
+  const outer = data as { tokens?: StoredAuthTokens } | StoredAuthTokens | null;
+  if (!outer) return {};
+  return 'tokens' in outer && outer.tokens ? outer.tokens : outer as StoredAuthTokens;
+}
+
+function isAuthFailure(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+function isRefreshRequest(path: string): boolean {
+  return path === AUTH_REFRESH_PATH || path.endsWith(AUTH_REFRESH_PATH);
+}
+
+async function refreshAccessTokenOnce(): Promise<string | null> {
+  if (!refreshInFlight) {
+    refreshInFlight = performTokenRefresh().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+async function performTokenRefresh(): Promise<string | null> {
+  const refreshToken = getStoredRefreshToken();
+  if (!refreshToken) {
+    clearAuthState();
+    return null;
+  }
+
+  const response = await fetch(buildUrl(AUTH_REFRESH_PATH), {
+    method: 'POST',
+    headers: {
+      [API_VERSION_HEADER]: '2024-01',
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({ refreshToken }),
+  });
+
+  if (isAuthFailure(response.status) || !response.ok) {
+    clearAuthState();
+    return null;
+  }
+
+  const refreshResponse = await parseResponse<unknown>(response);
+  const tokens = extractRefreshPayload(refreshResponse.data);
+  const accessToken = tokens.accessToken || tokens.token || null;
+  if (!accessToken) {
+    clearAuthState();
+    return null;
+  }
+
+  storeRefreshedTokens(tokens);
+  return accessToken;
+}
+
+function buildAuthError(status: number, message: string, path: string): ApiError {
+  return {
+    code: status,
+    message,
+    path,
+    timestamp: new Date().toISOString(),
+    suggestion: 'Please sign in again.',
+  };
+}
+
+function throwProcessedError(error: ApiError): never {
+  let processedError = error;
+  for (const interceptor of errorInterceptors) {
+    processedError = interceptor(processedError);
+  }
+  throw processedError;
+}
+
+function isApiErrorLike(error: unknown): error is ApiError {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && 'message' in error;
+}
+
+function createRequestConfig(
+  method: string,
+  url: string,
+  data?: unknown,
+  config?: RequestConfig
+): RequestInit & { url: string } {
+  let requestConfig: RequestInit & { url: string } = {
+    url,
+    method,
+    headers: { ...(config?.headers ?? {}) },
+    body: data ? JSON.stringify(data) : undefined,
+  };
+
+  for (const interceptor of requestInterceptors) {
+    requestConfig = interceptor(requestConfig);
+  }
+
+  return requestConfig;
+}
+
+async function sendRequest<T>(
+  requestConfig: RequestInit & { url: string },
+  timeout: number
+): Promise<ApiResponse<T>> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(requestConfig.url, {
+      ...requestConfig,
+      signal: controller.signal,
+    });
+    return await parseResponse<T>(response);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,30 +407,29 @@ async function request<T>(
   const timeout = config?.timeout ?? DEFAULT_TIMEOUT;
   const maxRetries = config?.retries ?? (method === 'GET' ? MAX_RETRIES : 0);
 
-  let requestConfig: RequestInit & { url: string } = {
-    url,
-    method,
-    headers: {} as Record<string, string>,
-    body: data ? JSON.stringify(data) : undefined,
-  };
-
-  // Apply request interceptors
-  for (const interceptor of requestInterceptors) {
-    requestConfig = interceptor(requestConfig);
-  }
-
   let lastError: Error | null = null;
+  let retryAfterRefresh = false;
+  let attempt = 0;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  while (attempt <= maxRetries) {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-      requestConfig.signal = controller.signal;
+      const requestConfig = createRequestConfig(method, url, data, config);
+      const responseData = await sendRequest<T>(requestConfig, timeout);
 
-      const response = await fetch(requestConfig.url, requestConfig);
-      clearTimeout(timeoutId);
-
-      const responseData = await parseResponse<T>(response);
+      if (isAuthFailure(responseData.status)) {
+        if (!isRefreshRequest(path) && !retryAfterRefresh) {
+          const refreshedToken = await refreshAccessTokenOnce();
+          if (refreshedToken) {
+            retryAfterRefresh = true;
+            continue;
+          }
+        }
+        throwProcessedError(buildAuthError(
+          responseData.status,
+          'Authentication failed. Token refresh did not succeed.',
+          path,
+        ));
+      }
 
       // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
@@ -244,11 +439,16 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (isApiErrorLike(error)) {
+        throw error;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
         const delay = RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, delay));
+        attempt++;
         continue;
       }
 
