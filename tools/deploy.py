@@ -368,6 +368,70 @@ def list_deployments(env: str, service: Optional[str] = None):
     print()
 
 
+def generate_rollback_summary(service: str, env: str, tag: str,
+                             planned_actions: Optional[List[str]] = None,
+                             rollback_steps: Optional[List[str]] = None,
+                             risk_notes: Optional[List[str]] = None) -> Dict:
+    """Build a structured dry-run rollback summary for audit review."""
+    env_config = ENVIRONMENTS.get(env, {})
+    service_config = SERVICES.get(service, {})
+    return {
+        "service": service,
+        "service_name": service_config.get("name", service),
+        "environment": env,
+        "namespace": env_config.get("namespace", ""),
+        "version": tag,
+        "generated_at": datetime.now().isoformat(),
+        "planned_actions": planned_actions or [],
+        "risk_notes": risk_notes or [],
+        "rollback_steps": rollback_steps or [],
+    }
+
+
+def format_rollback_summary_text(summary: Dict) -> str:
+    """Render a rollback summary dict as human-readable text."""
+    lines = [
+        "=" * 60,
+        "Dry-Run Rollback Summary",
+        "=" * 60,
+        f"Service:     {summary.get('service_name', summary.get('service', ''))}",
+        f"Environment: {summary.get('environment', '')}",
+        f"Namespace:   {summary.get('namespace', '')}",
+        f"Version/Tag: {summary.get('version', '')}",
+        f"Generated:   {summary.get('generated_at', '')}",
+        "",
+        "Planned actions:",
+    ]
+    for action in summary.get('planned_actions', []):
+        lines.append(f'  - {action}')
+    if not summary.get('planned_actions'):
+        lines.append('  (none)')
+    lines.append('')
+    lines.append('Risk notes:')
+    for note in summary.get('risk_notes', []):
+        lines.append(f'  ! {note}')
+    if not summary.get('risk_notes'):
+        lines.append('  (none)')
+    lines.append('')
+    lines.append('Rollback steps:')
+    for i, step in enumerate(summary.get('rollback_steps', []), 1):
+        lines.append(f'  {i}. {step}')
+    if not summary.get('rollback_steps'):
+        lines.append('  (none)')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def export_rollback_summary(summary: Dict, output_path: str, fmt: str = "text") -> None:
+    """Write a rollback summary to a file in text or JSON format."""
+    if fmt == 'json':
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, default=str)
+    else:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(format_rollback_summary_text(summary))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Deployment tool")
     parser.add_argument("--env", "-e", required=True, choices=list(ENVIRONMENTS.keys()),
@@ -383,6 +447,8 @@ def parse_args():
     parser.add_argument("--version", help="Version to rollback to")
     parser.add_argument("--list", action="store_true", help="List deployments")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--summary-output", help="Write dry-run rollback summary to a file")
+    parser.add_argument("--summary-format", choices=["text", "json"], default="text", help="Summary output format")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -404,7 +470,31 @@ def main():
             return 1
 
         if args.dry_run:
-            print(f"Would rollback {args.service} in {args.env} to {args.version}")
+            actions = [
+                f"Rollback {args.service} from current to {args.version}",
+                f"Skip build and test steps",
+                f"Run health check after rollback",
+            ]
+            risk = [
+                f"Rolling back may revert fixes shipped in newer versions",
+                f"Verify {args.version} is compatible with current schema",
+            ] if args.env == "production" else [
+                f"Non-production environment; lower rollback risk",
+            ]
+            steps = [
+                f"Tag current deployment for safety",
+                f"Apply version {args.version} to {args.service}",
+                f"Run health check on {args.service} in {args.env}",
+                f"Notify on-call if health check fails",
+            ]
+            summary = generate_rollback_summary(
+                args.service, args.env, args.version,
+                planned_actions=actions, rollback_steps=steps, risk_notes=risk,
+            )
+            print(format_rollback_summary_text(summary))
+            if args.summary_output:
+                export_rollback_summary(summary, args.summary_output, args.summary_format)
+                print(f"Summary written to {args.summary_output}")
             return 0
 
         success = rollback_service(args.service, args.env, args.version)
