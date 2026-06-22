@@ -27,13 +27,9 @@
 # fix was to add a max line length check. We did that. It still crashes.
 # The regex engine doesn't care about your max line length check.
 #
-# TODO: The Slack webhook URL is hardcoded below. This is fine for now
-# because it's a development-only deployment. The production deployment
-# uses a different URL that's stored in Vault. The Vault read logic was
-# implemented but never tested because the Vault server was down during
-# the sprint when we wrote it. We wrote a TODO to test it later. That
-# was 4 months ago. The production Slack webhook is still the hardcoded
-# one. The alerts go to #ops-alerts-test which nobody monitors.
+# Slack webhook URL loaded from SLACK_WEBHOOK_URL env var at startup.
+# Falls back to the dev dummy URL if unset. For production, set the
+# SLACK_WEBHOOK_URL environment variable before starting the daemon.
 #
 # Usage:
 #   ./log_watchdog.pl --config config.yaml
@@ -62,7 +58,7 @@ use constant {
     VERSION        => '2.0.0',
     DAEMON_NAME    => 'v2-log-watchdog',
     DEFAULT_CONFIG => '/etc/tent/watchdog.yaml',
-    SLACK_WEBHOOK  => 'https://hooks.slack.com/services/T00/DUMMY/FAKE',  # TODO: Read from Vault
+    SLACK_WEBHOOK  => \$ENV{SLACK_WEBHOOK_URL} // 'https://hooks.slack.com/services/T00/DUMMY/FAKE',  # Security: loaded from env var
     HEARTBEAT_FILE => '/tmp/v2-watchdog-heartbeat',
     PID_FILE       => '/tmp/v2-watchdog.pid',
     MAX_LINE_LEN   => 8192,  # lines longer than this get truncated before regex. mostly.
