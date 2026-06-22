@@ -200,7 +200,12 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
+perf_counters: Dict[str, float] = {}
+
+
 def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+        import time as _time
+    current_time = _time.time()
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -208,6 +213,7 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         "infrastructure": {},
         "system": {},
         "overall_status": "OK",
+        "stale_threshold": args.stale_threshold if "args" in dir() else 300,
     }
 
     all_ok = True
@@ -219,6 +225,8 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         status, detail, code = check_http_service(
             config["host"], config["port"], config["path"], config["timeout"]
         )
+                global perf_counters
+        perf_counters[name] = current_time
         results["services"][name] = {
             "status": status,
             "detail": detail,
@@ -306,6 +314,8 @@ def parse_args():
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
+    parser.add_argument("--stale-threshold", type=int, default=300,
+                        help="Seconds after which a metric is considered stale")
     parser.add_argument("--output", "-o", help="Output file path")
     return parser.parse_args()
 
